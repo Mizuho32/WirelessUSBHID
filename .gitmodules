@@ -1,0 +1,3 @@
+[submodule "esp32-kvm-ip"]
+	path = esp32-kvm-ip
+	url = https://github.com/KMChris/esp32-kvm-ip.git
