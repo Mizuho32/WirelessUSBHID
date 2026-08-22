@@ -9,7 +9,7 @@
 #   bin/build_host.sh build flash monitor
 
 if ! command -v idf.py; then
- source "${IDF_SH}"
+ source "${ESP_IDF}/export.sh"
 fi
 
 set -euo pipefail
