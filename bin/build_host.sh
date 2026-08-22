@@ -7,6 +7,11 @@
 #
 # Usage: bin/build_host.sh [idf.py args...]
 #   bin/build_host.sh build flash monitor
+
+if ! command -v idf.py; then
+ source "${IDF_SH}"
+fi
+
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/../esp32-kvm-ip"
 exec idf.py -B build.host -D KVM_ROLE=HOST "$@"
