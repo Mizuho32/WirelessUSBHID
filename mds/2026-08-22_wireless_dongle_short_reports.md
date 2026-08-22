@@ -125,3 +125,43 @@ ESP32側でこれ以上コードをいじって当てずっぽうを続けるよ
 1. Wireshark + usbmonで、このドングルの接続直後のUSB制御転送シーケンスをキャプチャ
 2. ESP32側(`usb_host_task.c`のUSB Hostタスク起動〜`handle_driver_connected()`)が実際に送っているシーケンスと比較
 3. 差分があれば、それを再現するようにESP32側の初期化シーケンスを調整して再テスト
+
+キャプチャ用のスクリプト(tcpdump + usbmon、Wireshark GUI無しでも解析可能)は`wireshark_9btn_mouse/`に用意した。手順は`wireshark_9btn_mouse/README.md`参照。
+
+## Linux実機キャプチャの解析結果と、SET_PROTOCOL除去実験(失敗)
+
+`wireshark_9btn_mouse/capture.sh`で実際にキャプチャ(`capture.pcap`, 14MB, bus全体・約16秒)。`tshark`(`sudo pacman -S wireshark-cli`でインストール)でデバイスアドレス115(このドングル)の列挙シーケンスを抽出:
+
+```
+GET_DESCRIPTOR(DEVICE) → GET_DESCRIPTOR(CONFIGURATION)x2(9byte→59byte) → GET_DESCRIPTOR(STRING)x3
+  (言語リスト, "Wireless Receiver", "Telink" ← 製造元。安価な2.4G HID用チップの定番ベンダー)
+→ SET_CONFIGURATION
+→ SET_IDLE(interface0=マウス, ReportID=0, Duration=0)
+→ GET_DESCRIPTOR(HID Report, interface0, 148byte ← 既知のマウス記述子と一致)
+→ SET_IDLE(interface1=キーボード)
+→ GET_DESCRIPTOR(HID Report, interface1, 65byte ← 既知のキーボード記述子と一致)
+→ SET_REPORT(Output, interface1 ← キーボードのLED初期化、Linuxの標準動作)
+→ 以降はinterrupt pollingのみ
+```
+
+**重要な発見: LinuxはこのドングルにSET_PROTOCOLを一度も送っていない。** ESP32側は明示的に`hid_class_request_set_protocol(HID_REPORT_PROTOCOL_REPORT)`を送っている。HID仕様上デバイスは電源投入時デフォルトでReport Protocolのはずなので、「SET_PROTOCOL要求自体がこのTelinkチップのファームウェアの何かおかしな状態を誘発しているのでは」という仮説を立てた。
+
+### 実験: マウス側のSET_PROTOCOL(Report)呼び出しを削除 → 効果無し、revert済み
+
+`usb_host_task.c`の該当箇所(`SET_IDLE`は残し、`SET_PROTOCOL(Report)`だけ削除)を変更してビルド・実機テストしたが、**依然として3バイートのまま**(ログも3 bytes)。つまりSET_PROTOCOLのネゴシエーション自体は今回の切り詰め現象の原因ではなかった。実害が無い変更ではあるものの、他のマウス(将来的にSET_PROTOCOLを本当に必要とする行儀の良くないデバイス)への互換性リスクだけが残るので、この変更は**revertして元の明示的SET_PROTOCOL呼び出しに戻した**(ビルド確認済み)。
+
+なお、この実験と同じタイミングでVolume Up時の挙動がおかしくなった(前回直したはずの「離しても押しっぱなし」的な症状)という報告があったが、この変更(SET_PROTOCOLの有無)とは論理的に無関係な箇所(該当のstuck-held修正は`hid_host_interface_callback()`側で、今回一切触っていない)なので、**ドングル側の無線受信ロスなど別要因の可能性が高い**。revert後に再現するか要確認、優先度低。
+
+### 現状の理解(更新)
+- `wMaxPacketSize`理論: 否定済み
+- SET_PROTOCOLネゴシエーション理論: **否定済み**(今回)
+- 残る説明: ESP32-S3のUSBホストコントローラ(dwc_otg)とこのドングルの間の、リクエスト内容ではなく**タイミング/バスの物理層挙動**に起因する何か。これを特定するには、ESP32⇔ドングル間を流れる実際の通信をキャプチャする必要があるが、usbmonはLinuxホスト側でしか使えないため、**ESP32が関与する通信は原理的にこの方法ではキャプチャできない**(usbmonで見れるのは今回のようにLinux PCとドングルの組み合わせだけ)。ハードウェアUSBプロトコルアナライザ(Beagleなど)が無い限り、これ以上の直接観測は難しい。
+- ホイール対応は一旦保留とし、既知の限定事項として受け入れる方向が妥当かもしれない。
+
+### 最終確認: GET_PROTOCOLはvalue=1(Report)を返す — それでも3バイート
+
+revert後の実機ログ: `SET_PROTOCOL(Report)=ESP_OK, GET_PROTOCOL=ESP_OK (value=1, 0=Boot 1=Report)`。つまりこのドングルは「Report Protocolのつもり」と自己申告し、こちらのSET_PROTOCOL要求にも正常にACKしている——**にも関わらず、実際に送ってくる生レポートは相変わらず3バイート(Boot Protocol形状)のまま**。これは「デバイスの自己申告するプロトコル状態」と「実際のレポート生成パイプライン」が内部的に完全に食い違っている、というこのドングルのファームウェア(Telinkチップ)側の一貫した不具合であることの最終確認になった。ESP32側・ホスト側からのリクエスト内容をどう変えても解決しない理由がこれで裏付けられた。
+
+一区切りとして、このドングルの**ホイール非対応は既知の限定事項として受け入れる**。
+
+(余談: この確認と同時に「Volume Up/Downがまた不安定」との報告があったが、直前の変更(SET_PROTOCOL revert)はこの症状のロジックに触れていないため、ドングル側の無線受信ロス等の間欠的な問題である可能性が高い。優先度低の別問題として保留。)
