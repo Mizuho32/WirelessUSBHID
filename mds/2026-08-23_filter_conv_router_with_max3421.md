@@ -110,9 +110,33 @@ ESP32S3-Plus標準SPIピン(MOSI=GPIO9 / MISO=GPIO8 / SCLK=GPIO7)+ CS=GPIO4 / RS
 - **INT**(GPIO6): MAX3421EのINTはオープンドレイン・Lowアクティブ - 直結でOK(コード側で内部プルアップ+立ち下がりエッジ割り込みを設定済み)。
 - **RST**(GPIO5): RESETもLowアクティブ。コード側で起動時に「Low 10ms → High 10ms待ち」のリセットパルスを打つように実装済み(発振器安定待ち)。フローティングにしないこと。
 
-### 未実装(実機確認後の次ステップ)
-- SPIプローブによるMAX3421自動検出→バックエンド選択(現状は無条件起動。ハード未配線でも安全だが、正式なフォールバック判定ではない)
-- `hid_report_parser.c`/`filter_rules.h`/`protocol.h`への接続(現状はダンプのみ)
-- 9ボタンマウスquirkコードが本当に不要か、実機での確認
+### 実機確認: Report Protocolの取り忘れ、SPIクロック起因の不安定さ
+
+実配線後、最初は`tuh_hid_report_received_cb`が3バイート(`00 00 01`)を返してきて一瞬「ESP32ネイティブ側と同じバグがMAX3421でも再現したか」と焦ったが、原因は単純: TinyUSBはデフォルトでBoot Protocol(`hid_host.c`の`_hidh_default_protocol = HID_PROTOCOL_BOOT`)なので、RP2040クロステストの時と同様`tuh_hid_set_default_protocol(HID_PROTOCOL_REPORT)`の呼び出しが要る。これを`max3421_host_task()`(`tuh_rhport_init()`より前)に追加したら7バイート(Report ID込み)が届くようになった — ESP32ネイティブ側の謎バグの再来ではなく、単なる実装漏れだった。
+
+その後「MAX3421 unmountがすぐ起きて不安定」という報告あり。VBUS(5V)・MAX3421 VCC(3.3V)は共に配線済みと確認済みなので、電源不足ではなく**SPIクロック(当初10MHz)がブレッドボード配線には速すぎた**線が濃厚と判断し、`MAX3421_SPI_CLOCK_HZ`を1MHzまで下げた。HIDは元々低帯域なので速度を犠牲にする価値は十分にある。この不安定さの根本解決は保留にして先に進む方針(最悪RP2040をUSB Hostとして使う代替案あり)。
+
+## Phase1 完了: `hid_forwarder.c`への集約 + `usb_host_max3421.c`の本実装
+
+Phase1の最後のステップ(`hid_report_parser.c`/`filter_rules.h`/`protocol.h`への接続)を実施。
+
+### リファクタ: UDP送信+filter/mergeロジックを`hid_forwarder.c`に切り出し
+これまで`usb_host_task.c`(native OTGバックエンド)に直書きだった、UDPソケット管理・`filter_rules.h`適用・キーボードのマージ状態(物理キーボード+マウスボタンからの合成キーの合成、`mds/2026-08-21_filter_conv_route.md`)を、新設の`main/hid_forwarder.c`/`.h`に切り出した。両バックエンドが呼ぶ公開APIは3つだけ:
+- `hid_forwarder_keyboard_report(modifiers, keycodes[6])`
+- `hid_forwarder_mouse_sample(buttons, dx, dy, wheel, pan)`
+- `hid_forwarder_consumer(usage_id)`
+
+`main_host.c`が起動時に`hid_forwarder_init()`を1回呼び(UDPソケット作成)、その後`usb_host_task_start()`(native OTG)と`usb_host_max3421_task_start()`(MAX3421)を両方起動する形。`usb_host_task.c`側もこの`hid_forwarder_*`呼び出しに置き換え、重複コードを解消(退行なし、ビルド確認済み)。
+
+### `usb_host_max3421.c`: デバイス種別判定・記述子パース・ディスパッチを本実装
+`tuh_hid_mount_cb`/`tuh_hid_report_received_cb`で、`usb_host_task.c`の`handle_driver_connected`/`hid_host_interface_callback`とほぼ同じロジック(マウス/キーボード/Consumer Controlの判定、`hid_report_parser.c`でのReport Descriptorパース、Report/Boot Protocolの切り替え)を`tuh_hid_*` API向けに実装。デバイス状態は`hid_host_device_handle_t`の代わりに`(dev_addr, idx)`をキーに管理。
+
+**9ボタンマウスの3バイート切り詰めquirk対応コード(`last_boot_consumer_usage`)は移植していない** — TinyUSB経由では実機で7バイート丸ごと正しく届くことを確認済みなので不要と判断(ただし実際の9ボタンマウス実機での再確認はまだ)。
+
+### 未実装(次ステップ)
+- SPIプローブによるMAX3421自動検出→バックエンド選択(現状は無条件で両方起動)
+- MAX3421のunmount不安定さの根本解決(保留中、最悪RP2040をUSB Hostとして使う代替案あり)
+- 9ボタンマウス実機での再確認(quirk無しで本当に問題ないか)
+- Hub経由の複数デバイス確認(`mds/2026-08-22_multi_device.md`の要件)
 
 ## Phase2 route/filterの詳細を詰める
