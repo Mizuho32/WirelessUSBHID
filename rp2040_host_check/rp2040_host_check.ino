@@ -17,6 +17,28 @@
 
 Adafruit_USBH_Host USBHost;
 
+// mds/2026-08-24_rp2040_bridge_fps_investigation.md follow-up: isolating
+// whether the ~100Hz ceiling measured through rp2040_host_bridge.ino is
+// inherent to this RP2040 hosting this device at all (TinyUSB Host
+// scheduling, or the device's own bInterval), or specific to the
+// bridge's added per-report work (UART framing/checksum/transmission).
+// This sketch has none of that - it's the simplest possible RP2040 Host
+// sketch for this dongle - so if it *also* caps out around the same
+// rate, the bridge protocol itself is cleared as a suspect. Off by
+// default: printing every raw report over Serial1 (115200 baud, much
+// slower than the bridge's 460800) is itself slow enough to throttle
+// the measurement, so RAW_DUMP and RATE_MONITOR are mutually exclusive
+// in practice - turn on whichever one you actually need for a given
+// test.
+#define RAW_DUMP      1
+#define RATE_MONITOR  0
+
+#if RATE_MONITOR
+static uint32_t s_report_count;
+static uint32_t s_last_report_us;
+static uint32_t s_min_interval_us;
+#endif
+
 void setup() {
   Serial1.begin(115200);
   delay(500);
@@ -33,6 +55,22 @@ void setup() {
 void loop() {
   USBHost.task();
   Serial1.flush();
+
+#if RATE_MONITOR
+  {
+    static uint32_t last_print_ms;
+    uint32_t now = millis();
+    if (now - last_print_ms >= 1000) {
+      last_print_ms = now;
+      uint32_t count = s_report_count;
+      uint32_t min_interval = s_min_interval_us;
+      s_report_count = 0;
+      s_min_interval_us = 0;
+      Serial1.printf("[rate] %lu reports/sec, min interval %luus\r\n",
+                      (unsigned long)count, (unsigned long)min_interval);
+    }
+  }
+#endif
 }
 
 void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t idx, const uint8_t *report_desc, uint16_t desc_len) {
@@ -57,11 +95,25 @@ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t idx) {
 }
 
 void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t idx, const uint8_t *report, uint16_t len) {
+#if RATE_MONITOR
+  s_report_count++;
+  uint32_t now_us = micros();
+  if (s_last_report_us != 0) {
+    uint32_t interval = now_us - s_last_report_us;
+    if (s_min_interval_us == 0 || interval < s_min_interval_us) {
+      s_min_interval_us = interval;
+    }
+  }
+  s_last_report_us = now_us;
+#endif
+
+#if RAW_DUMP
   Serial1.printf("[%u:%u] raw report (%u bytes): ", dev_addr, idx, len);
   for (uint16_t i = 0; i < len; i++) {
     Serial1.printf("%02x ", report[i]);
   }
   Serial1.println();
+#endif
 
   // Keep polling - TinyUSB does not auto-resubmit.
   tuh_hid_receive_report(dev_addr, idx);
