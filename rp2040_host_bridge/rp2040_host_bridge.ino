@@ -102,6 +102,23 @@ Adafruit_USBH_Host USBHost;
 static uint32_t s_report_count;
 #endif
 
+#if RATE_MONITOR
+// Tracks the shortest gap seen between two consecutive
+// tuh_hid_report_received_cb() calls, reset every print window
+// (mds/2026-08-24_rp2040_bridge_fps_investigation.md follow-up: ESP32
+// dispatch/UART/type-c submission all measured clean at ~100Hz with no
+// drops, so if this device is actually *capable* of polling faster than
+// that, the ceiling must be here on the RP2040 host side - either the
+// device's own bInterval, or the single-buffered "process then re-arm"
+// pattern below adding software latency between polls. A steady
+// ~10000us minimum every window points at the device's own bInterval
+// (nothing to fix); a minimum well below the observed average interval
+// (e.g. bursts of ~2000-3000us gaps that don't sustain) points at a
+// software-side stall being the real ceiling instead.
+static uint32_t s_last_report_us;
+static uint32_t s_min_interval_us;
+#endif
+
 static uint32_t last_heartbeat_ms;
 
 // Re-announce currently-mounted devices periodically: tuh_hid_mount_cb()
@@ -259,8 +276,11 @@ void loop() {
     if (now - last_rate_print_ms >= 1000) {
       last_rate_print_ms = now;
       uint32_t count = s_report_count;
+      uint32_t min_interval = s_min_interval_us;
       s_report_count = 0;
-      DEBUG_PRINTF("[rate] %lu reports/sec\r\n", (unsigned long)count);
+      s_min_interval_us = 0;
+      DEBUG_PRINTF("[rate] %lu reports/sec, min interval %luus\r\n",
+                    (unsigned long)count, (unsigned long)min_interval);
     }
   }
 #endif
@@ -343,6 +363,18 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t idx, const uint8_t *re
 #if RATE_MONITOR || POLL_CEILING_TEST
   s_report_count++;
 #endif
+#if RATE_MONITOR
+  {
+    uint32_t now_us = micros();
+    if (s_last_report_us != 0) {
+      uint32_t interval = now_us - s_last_report_us;
+      if (s_min_interval_us == 0 || interval < s_min_interval_us) {
+        s_min_interval_us = interval;
+      }
+    }
+    s_last_report_us = now_us;
+  }
+#endif
 #if BRIDGE_DEBUG
   DEBUG_PRINTF("[%u:%u] raw report (%u bytes): ", dev_addr, idx, len);
   for (uint16_t i = 0; i < len; i++) {
@@ -351,11 +383,23 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t idx, const uint8_t *re
   DEBUG_PRINTF("\r\n");
 #endif
 
-  if (len > 512) {
-    len = 512;
-  }
-  send_frame(BRIDGE_MSG_REPORT, dev_addr, idx, itf_protocol, report, len);
+  // A HID report on a Full Speed interrupt endpoint can't exceed 64
+  // bytes (wMaxPacketSize) - comfortably fits a fixed local copy, unlike
+  // MOUNT's report descriptor (up to MAX_TRACKED_DESC_LEN/512).
+  uint8_t local_report[64];
+  uint16_t copy_len = len > sizeof(local_report) ? (uint16_t)sizeof(local_report) : len;
+  memcpy(local_report, report, copy_len);
 
-  // Keep polling - TinyUSB does not auto-resubmit.
+  // Re-arm before transmitting the UART frame, not after - previously
+  // this order was reversed, so every report's full send_frame() cost
+  // (several Serial1.write() calls, ~350us worth of bytes at 460800
+  // baud) happened before TinyUSB was told to accept the next transfer,
+  // adding that much software-side delay to every USB poll cycle on top
+  // of whatever the device's own bInterval already imposes. Copying the
+  // report out to a local buffer first (a handful of bytes, <1us) keeps
+  // this safe even though `report` itself points at a TinyUSB-owned
+  // buffer that tuh_hid_receive_report() may start reusing once armed.
   tuh_hid_receive_report(dev_addr, idx);
+
+  send_frame(BRIDGE_MSG_REPORT, dev_addr, idx, itf_protocol, local_report, copy_len);
 }
