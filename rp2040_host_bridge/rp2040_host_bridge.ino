@@ -56,12 +56,50 @@ Adafruit_USBH_Host USBHost;
 // instead of debug text in the first place).
 #define BRIDGE_DEBUG 0
 
-#if BRIDGE_DEBUG
+// Toggle for a running reports/sec counter, printed on Serial2 once a
+// second (mds/2026-08-24_rp2040_bridge_fps_investigation.md measurement
+// plan, point 1: how fast is the dongle/tuh_hid_report_received_cb()
+// actually firing, independent of the UART link to the ESP32 or
+// anything downstream of it). This does NOT run on a second core/thread
+// - a plain counter incremented inside the existing callback and
+// checked once per loop() iteration is enough, and staying single-core
+// avoids having to make USBHost's TinyUSB Host stack itself
+// thread-safe across cores (arduino-pico's core1 via setup1()/loop1()
+// is real, but TinyUSB's tuh_* calls all assume they're only ever
+// touched from the one task/core running USBHost.task() - splitting
+// that across cores would need its own locking and isn't worth it just
+// to print a counter). Separate from BRIDGE_DEBUG's raw hex dumps
+// above: those turned out to be heavy enough to perturb timing while
+// chasing the type-c crash (mds/2026-08-23_rp2040_host_status.md) - an
+// integer increment plus one printf/sec should not have that problem,
+// but keep an eye out.
+#define RATE_MONITOR 1
+
+// Toggle for a one-shot, interactive "how fast can this mouse/dongle
+// actually poll" measurement, run once in setup() before the bridge
+// starts normal operation. Prompts over Serial2 for a few seconds of
+// continuous mouse movement, then reports the peak instantaneous and
+// average reports/sec seen. Off by default - it blocks setup() waiting
+// on real mouse input, so only turn on for a deliberate bench test.
+#define POLL_CEILING_TEST 0
+#define POLL_CEILING_WAIT_SECONDS  5   // time given to let the device enumerate first
+#define POLL_CEILING_TEST_SECONDS  5   // measurement window once movement starts
+#define POLL_CEILING_WINDOW_MS   100   // sub-window size used to find the peak rate
+
+#if BRIDGE_DEBUG || RATE_MONITOR || POLL_CEILING_TEST
 #define DEBUG_BEGIN()      Serial2.begin(115200)
 #define DEBUG_PRINTF(...)  Serial2.printf(__VA_ARGS__)
 #else
 #define DEBUG_BEGIN()
 #define DEBUG_PRINTF(...)
+#endif
+
+#if RATE_MONITOR || POLL_CEILING_TEST
+// Incremented from tuh_hid_report_received_cb() below, read/reset from
+// loop() and/or run_poll_ceiling_test() - both only ever run from the
+// same core/task as USBHost.task(), so this is single-threaded in
+// practice despite not being atomic.
+static uint32_t s_report_count;
 #endif
 
 static uint32_t last_heartbeat_ms;
@@ -140,6 +178,56 @@ static void send_frame(uint8_t msg_type, uint8_t dev_addr, uint8_t idx, uint8_t 
   Serial1.write(checksum);
 }
 
+#if POLL_CEILING_TEST
+// Blocking, interactive measurement - see the POLL_CEILING_TEST comment
+// above. Runs USBHost.task() itself in a tight loop for the duration
+// (mount/report callbacks still fire normally, including send_frame()
+// to the ESP32 if one happens to be listening), so any device already
+// plugged in enumerates and gets polled exactly as it would in normal
+// operation - this just measures the callback rate rather than doing
+// anything different with it.
+static void run_poll_ceiling_test(void) {
+  DEBUG_PRINTF("\r\n[poll-ceiling-test] waiting %us for the device to enumerate...\r\n",
+               (unsigned)POLL_CEILING_WAIT_SECONDS);
+  uint32_t wait_until = millis() + POLL_CEILING_WAIT_SECONDS * 1000UL;
+  while ((int32_t)(wait_until - millis()) > 0) {
+    USBHost.task();
+  }
+
+  DEBUG_PRINTF("[poll-ceiling-test] move the mouse continuously/steadily for %us NOW...\r\n",
+               (unsigned)POLL_CEILING_TEST_SECONDS);
+  s_report_count = 0;
+  uint32_t last_total = 0;
+  uint32_t peak_rate = 0;
+  uint32_t window_start = millis();
+  uint32_t test_start = window_start;
+  uint32_t test_until = test_start + POLL_CEILING_TEST_SECONDS * 1000UL;
+
+  while ((int32_t)(test_until - millis()) > 0) {
+    USBHost.task();
+    uint32_t now = millis();
+    if (now - window_start >= POLL_CEILING_WINDOW_MS) {
+      uint32_t current_total = s_report_count;
+      uint32_t window_delta = current_total - last_total;
+      last_total = current_total;
+      window_start = now;
+      uint32_t window_rate = window_delta * 1000UL / POLL_CEILING_WINDOW_MS;
+      if (window_rate > peak_rate) {
+        peak_rate = window_rate;
+      }
+    }
+  }
+
+  uint32_t total_reports = s_report_count;
+  uint32_t avg_rate = total_reports * 1000UL / (POLL_CEILING_TEST_SECONDS * 1000UL);
+  DEBUG_PRINTF("[poll-ceiling-test] done: %lu reports in %us (avg %lu/s, peak %lu/s over %ums windows)\r\n",
+               (unsigned long)total_reports, (unsigned)POLL_CEILING_TEST_SECONDS,
+               (unsigned long)avg_rate, (unsigned long)peak_rate, (unsigned)POLL_CEILING_WINDOW_MS);
+  DEBUG_PRINTF("[poll-ceiling-test] resuming normal bridge operation.\r\n\r\n");
+  s_report_count = 0;
+}
+#endif
+
 void setup() {
   Serial1.begin(BRIDGE_BAUD);
   DEBUG_BEGIN();
@@ -151,6 +239,11 @@ void setup() {
   tuh_hid_set_default_protocol(HID_PROTOCOL_REPORT);
 
   USBHost.begin(0);
+
+#if POLL_CEILING_TEST
+  run_poll_ceiling_test();
+#endif
+
   last_heartbeat_ms = millis();
   last_reannounce_ms = millis();
 }
@@ -158,10 +251,23 @@ void setup() {
 void loop() {
   USBHost.task();
 
+  uint32_t now = millis();
+
+#if RATE_MONITOR
+  {
+    static uint32_t last_rate_print_ms;
+    if (now - last_rate_print_ms >= 1000) {
+      last_rate_print_ms = now;
+      uint32_t count = s_report_count;
+      s_report_count = 0;
+      DEBUG_PRINTF("[rate] %lu reports/sec\r\n", (unsigned long)count);
+    }
+  }
+#endif
+
   // Sent regardless of USB device state so the ESP32 side can probe for
   // this bridge's presence (usb_host_rp2040_bridge_probe()) without
   // needing anything plugged in yet.
-  uint32_t now = millis();
   if (now - last_heartbeat_ms >= HEARTBEAT_INTERVAL_MS) {
     last_heartbeat_ms = now;
     send_frame(BRIDGE_MSG_HEARTBEAT, 0, 0, 0, NULL, 0);
@@ -234,6 +340,9 @@ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t idx) {
 
 void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t idx, const uint8_t *report, uint16_t len) {
   uint8_t const itf_protocol = tuh_hid_interface_protocol(dev_addr, idx);
+#if RATE_MONITOR || POLL_CEILING_TEST
+  s_report_count++;
+#endif
 #if BRIDGE_DEBUG
   DEBUG_PRINTF("[%u:%u] raw report (%u bytes): ", dev_addr, idx, len);
   for (uint16_t i = 0; i < len; i++) {

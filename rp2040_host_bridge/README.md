@@ -25,3 +25,12 @@ bin/build_flash_rp2040.sh rp2040_host_bridge tinyusb_host flash
 RP2040ボード自体のUSBコネクタ(ドングルを挿す方)の背後にはUARTは一切無い——チップ本体のUSB D+/D-ピンに直結されているだけなので(`mds/2026-08-22_rp2040_host_check.md`参照)、`BRIDGE_DEBUG`の設定に関わらずHost動作中はデバッグ出力に使えない。
 
 ESP32を繋がずにドングル/TinyUSB Host側だけを単体でデバッグしたい場合は、代わりに`rp2040_host_check/`を使うこと——そちらは引き続き`Serial1`をプレーンテキスト出力に使っている。
+
+## FPS切り分け用ツール: `RATE_MONITOR` / `POLL_CEILING_TEST`
+
+`mds/2026-08-24_rp2040_bridge_fps_investigation.md`の実測案(点1: RP2040自体のレポート受信レート)向け。どちらも出力先は`BRIDGE_DEBUG`と同じ`Serial2`。
+
+- **`RATE_MONITOR`**(デフォルト1=有効): `tuh_hid_report_received_cb()`が呼ばれた回数を1秒ごとに`Serial2`へ`[rate] N reports/sec`として出力し続ける常時カウンタ。`BRIDGE_DEBUG`の生レポートダンプと違い、カウンタのインクリメント+1秒に1回のprintfのみなので、タイミングを乱してクラッシュを隠していた例の生ダンプほどの負荷にはならない見込み(が、要注意)。
+- **`POLL_CEILING_TEST`**(デフォルト0=無効): `setup()`内で一度だけ走る対話的な計測。有効にすると起動後`Serial2`に「そのまま待て」→「今からN秒間マウスを動かし続けて」と出て、その間のピーク瞬間レート・平均レートを計測して表示してから通常動作に戻る。`setup()`をブロックして実際にマウスを動かす必要があるので、ベンチ目的で意図的に有効にする時だけONにすること。
+
+どちらも別コア(RP2040のcore1、arduino-picoの`setup1()`/`loop1()`)は使っていない——TinyUSBの`tuh_*`呼び出しは`USBHost.task()`を回している1つのコア/タスクからしか触られない前提なので、カウンタを見るためだけに複数コアに跨いだロックを持ち込む価値はないと判断し、既存の`loop()`一回ごとのチェックで済ませている。
