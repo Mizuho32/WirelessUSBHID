@@ -70,4 +70,44 @@ ESP-IDFの`driver/spi_master.h`(SPIマスター)+ GPIO割り込み(INTピン、M
 4. **確認できたら本実装へ**: SPIプローブによるMAX3421検出→バックエンド選択のロジックを`usb_host_task.c`(またはその周辺)に実装し、`hid_report_parser.c`/`filter_rules.h`/`protocol.h`送信ロジックを両バックエンド共通で繋ぎ込む。9ボタンマウスquirkコードが本当に不要になったかもここで確認。
 5. **Hub経由の複数デバイス**確認(`mds/2026-08-22_multi_device.md`の要件)。MAX3421フォールバック時・native OTG時それぞれで。
 
+## Phase1 実装結果(ビルド確認済み、実機未検証)
+
+上記の提案通りソフト側を実装し、`bin/build_host.sh build`(Host role)・`bin/build_device.sh build`(Device role、退行確認)ともに警告0件でビルドが通るところまで確認した。実装過程で当初案から2点訂正が要った。
+
+### 訂正1: 本家TinyUSBのsubmodule追加ではなく、既存vendorコピーをそのままローカルcomponent化
+
+「本家`hathach/tinyusb`をgit submoduleで追加」ではなく、**既に`managed_components/espressif__tinyusb`にvendorされている(Espressifが取り込み済みの)全く同じソースツリーをそのまま`esp32-kvm-ip/components/tinyusb/`にコピーし、`main/idf_component.yml`の`override_path`でそちらを使うよう指定**する方式にした。理由: 新規にsubmoduleを足すと「Device roleが使うEspressifパッケージ」と「Host roleが使う本家素コピー」の2系統のtinyusbバージョンが並存し将来ズレるリスクがあるが、今回の方式なら**プロジェクト全体で常に単一のtinyusbソースツリー**(Host roleはこのローカルcomponentを、Device roleは元々のEspressifパッケージ相当を、同じソースから使い分けるだけ)で済む。`override_path`はESP Component Managerの正規機能で、`idf.py reconfigure`時に`managed_components/espressif__tinyusb`を自動的に使わなくなることも確認済み(`dependencies.lock`の該当エントリが`source: {type: local, path: components/tinyusb}`に変化)。
+
+### 訂正2: `main/tusb_config.h`は実は完全に無効(Device roleも含めて)だった
+
+「`tusb_config.h`はDevice role専用の単一ファイルなので`CFG_TUSB_CONFIG_FILE`でHost role用に差し替える」という当初案は、調査の結果**前提から誤りだった**。実際には`espressif/esp_tinyusb`のCMakeLists.txtが
+
+```cmake
+idf_component_get_property(tusb_lib ${tinyusb_name} COMPONENT_LIB)
+target_include_directories(${tusb_lib} PRIVATE "include")
+```
+
+という形で、tinyusbライブラリターゲットに**自分自身の(esp_tinyusbにバンドルされた)`include/tusb_config.h`を直接インクルードパスとして注入**しており、これがDevice roleの実際の設定として使われている。`main/tusb_config.h`はどのビルドコマンドの`-I`にも一度も出てこないことを`compile_commands.json`で確認した — つまり存在するだけで**Device roleも含めて一度も実際に読まれていなかった**(元々の`CFG_TUD_HID=3`等の値は生きているように見えて実は無意味で、本当のDevice用設定はesp_tinyusb側のKconfig駆動の設定ファイルの方)。
+
+このため、Host role用のTinyUSB設定は`main/tusb_config.h`ではなく**`components/tinyusb/host_config/tusb_config.h`(新設、component内)に置き**、`components/tinyusb/CMakeLists.txt`側で
+
+```cmake
+target_include_directories(${COMPONENT_LIB} BEFORE PRIVATE "host_config")
+```
+
+として`BEFORE`で強制的に先頭に挿入することで、esp_tinyusbの注入(処理タイミングに関係なく)より確実に勝たせている。あわせて、Host role分の`srcs`は「追加」ではなく「Device用ファイル一式を丸ごと差し替え」(排他)にした — 同じ`tusb_config.h`をDevice用ファイル(`dcd_dwc2.c`/`usbd.c`等)にも使わせるとCFG_TUD_*が欠落して壊れるため、Host roleではそもそもDevice用ファイルをコンパイル対象に含めない方が単純かつ安全と判断。
+
+### 実装した追加API
+
+`hcd_max3421.c`が要求する3つのボードAPI(`tuh_max3421_spi_cs_api`/`spi_xfer_api`/`int_api`)に加えて、TinyUSBコア(`tusb_common.h`)が要求するミリ秒タイマーAPI(`tusb_time_millis_api`/`tusb_time_delay_ms_api`、FreeRTOSの`xTaskGetTickCount()`ベースで実装)も必要だった(リンクエラーで発覚)。
+
+### 新規ファイル
+- `esp32-kvm-ip/components/tinyusb/`: 上記のローカルoverride component(`managed_components/espressif__tinyusb`のコピー + Host role用`srcs`分岐 + `host_config/tusb_config.h`)
+- `esp32-kvm-ip/main/usb_host_max3421.c`/`.h`: SPI+GPIOグルー実装 + Phase1スモークテスト(`tuh_hid_mount_cb`/`report_received_cb`で記述子・生レポートをそのままログ出力するだけ、`rp2040_host_check.ino`と同じ発想)。`main_host.c`から既存のnative OTGパス(`usb_host_task_start()`)と**並行して無条件に**呼ぶようにした(失敗しても非致命的 - ログを出して続行するだけ)。ピン配置(`MAX3421_PIN_*`)はプレースホルダなので実配線に合わせて要調整。
+
+### 未実装(実機確認後の次ステップ)
+- SPIプローブによるMAX3421自動検出→バックエンド選択(現状は無条件起動。ハード未配線でも安全だが、正式なフォールバック判定ではない)
+- `hid_report_parser.c`/`filter_rules.h`/`protocol.h`への接続(現状はダンプのみ)
+- 9ボタンマウスquirkコードが本当に不要か、実機での確認
+
 ## Phase2 route/filterの詳細を詰める
