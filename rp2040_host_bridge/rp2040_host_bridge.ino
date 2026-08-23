@@ -15,6 +15,8 @@
 // BRIDGE_DEBUG to 1 below to print human-readable mount/report dumps
 // there (same format as rp2040_host_check.ino) without disturbing the
 // live bridge link on Serial1.
+#include <string.h>
+
 #include "Adafruit_TinyUSB.h"
 
 #ifndef USE_TINYUSB_HOST
@@ -52,7 +54,7 @@ Adafruit_USBH_Host USBHost;
 // it, so it can't be used for debug output at all once acting as Host
 // (same reason Serial1 had to be repurposed for the bridge protocol
 // instead of debug text in the first place).
-#define BRIDGE_DEBUG 1
+#define BRIDGE_DEBUG 0
 
 #if BRIDGE_DEBUG
 #define DEBUG_BEGIN()      Serial2.begin(115200)
@@ -63,6 +65,50 @@ Adafruit_USBH_Host USBHost;
 #endif
 
 static uint32_t last_heartbeat_ms;
+
+// Re-announce currently-mounted devices periodically: tuh_hid_mount_cb()
+// only fires once, at the actual moment of USB enumeration - if the
+// ESP32 side reboots (e.g. reflashing firmware) while a device is
+// already mounted here (RP2040 wasn't rebooted), it would otherwise
+// never learn about it at all (REPORT frames keep arriving but never
+// get registered/dispatched on that side - see
+// mds/2026-08-23_rp2040_as_host_bridge_plan.md). Track mounted devices
+// here and periodically re-send their MOUNT frame; usb_host_rp2040_bridge.c's
+// registration is idempotent so re-announcing an already-known device
+// is harmless.
+#define MAX_TRACKED_DEVICES    4
+#define MAX_TRACKED_DESC_LEN   512
+#define REANNOUNCE_INTERVAL_MS 2000
+
+typedef struct {
+  bool in_use;
+  uint8_t dev_addr;
+  uint8_t idx;
+  uint8_t itf_protocol;
+  uint16_t desc_len;
+  uint8_t desc[MAX_TRACKED_DESC_LEN];
+} tracked_device_t;
+
+static tracked_device_t tracked_devices[MAX_TRACKED_DEVICES];
+static uint32_t last_reannounce_ms;
+
+static tracked_device_t *find_tracked_device(uint8_t dev_addr, uint8_t idx) {
+  for (int i = 0; i < MAX_TRACKED_DEVICES; i++) {
+    if (tracked_devices[i].in_use && tracked_devices[i].dev_addr == dev_addr && tracked_devices[i].idx == idx) {
+      return &tracked_devices[i];
+    }
+  }
+  return NULL;
+}
+
+static tracked_device_t *alloc_tracked_device(void) {
+  for (int i = 0; i < MAX_TRACKED_DEVICES; i++) {
+    if (!tracked_devices[i].in_use) {
+      return &tracked_devices[i];
+    }
+  }
+  return NULL;
+}
 
 static void send_frame(uint8_t msg_type, uint8_t dev_addr, uint8_t idx, uint8_t itf_protocol,
                         const uint8_t *payload, uint16_t len) {
@@ -106,6 +152,7 @@ void setup() {
 
   USBHost.begin(0);
   last_heartbeat_ms = millis();
+  last_reannounce_ms = millis();
 }
 
 void loop() {
@@ -118,6 +165,16 @@ void loop() {
   if (now - last_heartbeat_ms >= HEARTBEAT_INTERVAL_MS) {
     last_heartbeat_ms = now;
     send_frame(BRIDGE_MSG_HEARTBEAT, 0, 0, 0, NULL, 0);
+  }
+
+  if (now - last_reannounce_ms >= REANNOUNCE_INTERVAL_MS) {
+    last_reannounce_ms = now;
+    for (int i = 0; i < MAX_TRACKED_DEVICES; i++) {
+      if (tracked_devices[i].in_use) {
+        send_frame(BRIDGE_MSG_MOUNT, tracked_devices[i].dev_addr, tracked_devices[i].idx,
+                   tracked_devices[i].itf_protocol, tracked_devices[i].desc, tracked_devices[i].desc_len);
+      }
+    }
   }
 }
 
@@ -142,6 +199,24 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t idx, const uint8_t *report_desc,
   }
   send_frame(BRIDGE_MSG_MOUNT, dev_addr, idx, itf_protocol, report_desc, desc_len);
 
+  // Track for periodic re-announcement (see the block comment above
+  // tracked_devices) - find_tracked_device() first in case a stale
+  // entry for this dev_addr/idx slipped through without its umount
+  // (shouldn't normally happen, but avoids leaking a tracked_devices
+  // slot if it did).
+  tracked_device_t *tracked = find_tracked_device(dev_addr, idx);
+  if (!tracked) {
+    tracked = alloc_tracked_device();
+  }
+  if (tracked) {
+    tracked->in_use = true;
+    tracked->dev_addr = dev_addr;
+    tracked->idx = idx;
+    tracked->itf_protocol = itf_protocol;
+    tracked->desc_len = desc_len < MAX_TRACKED_DESC_LEN ? desc_len : MAX_TRACKED_DESC_LEN;
+    memcpy(tracked->desc, report_desc, tracked->desc_len);
+  }
+
   if (!tuh_hid_receive_report(dev_addr, idx)) {
     DEBUG_PRINTF("Error: cannot request initial report (dev_addr=%u idx=%u)\r\n", dev_addr, idx);
   }
@@ -150,6 +225,11 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t idx, const uint8_t *report_desc,
 void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t idx) {
   DEBUG_PRINTF("HID unmount: dev_addr=%u idx=%u\r\n", dev_addr, idx);
   send_frame(BRIDGE_MSG_UNMOUNT, dev_addr, idx, 0, NULL, 0);
+
+  tracked_device_t *tracked = find_tracked_device(dev_addr, idx);
+  if (tracked) {
+    tracked->in_use = false;
+  }
 }
 
 void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t idx, const uint8_t *report, uint16_t len) {
