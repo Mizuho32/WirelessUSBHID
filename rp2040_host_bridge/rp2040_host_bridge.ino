@@ -383,23 +383,23 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t idx, const uint8_t *re
   DEBUG_PRINTF("\r\n");
 #endif
 
-  // A HID report on a Full Speed interrupt endpoint can't exceed 64
-  // bytes (wMaxPacketSize) - comfortably fits a fixed local copy, unlike
-  // MOUNT's report descriptor (up to MAX_TRACKED_DESC_LEN/512).
-  uint8_t local_report[64];
-  uint16_t copy_len = len > sizeof(local_report) ? (uint16_t)sizeof(local_report) : len;
-  memcpy(local_report, report, copy_len);
-
-  // Re-arm before transmitting the UART frame, not after - previously
-  // this order was reversed, so every report's full send_frame() cost
-  // (several Serial1.write() calls, ~350us worth of bytes at 460800
-  // baud) happened before TinyUSB was told to accept the next transfer,
-  // adding that much software-side delay to every USB poll cycle on top
-  // of whatever the device's own bInterval already imposes. Copying the
-  // report out to a local buffer first (a handful of bytes, <1us) keeps
-  // this safe even though `report` itself points at a TinyUSB-owned
-  // buffer that tuh_hid_receive_report() may start reusing once armed.
+  // Reverted: an earlier attempt here re-armed (tuh_hid_receive_report())
+  // BEFORE send_frame(), on the theory that send_frame()'s ~350us of
+  // Serial1.write() calls were adding that much software latency to
+  // every poll cycle before TinyUSB was told to accept the next
+  // transfer. In practice this corrupted the UART stream instead
+  // (checksum mismatches / bogus frame lengths on the ESP32 side,
+  // worst right after boot) - re-arming appears able to trigger a
+  // reentrant call into this same callback (a burst of already-buffered
+  // reports arriving back-to-back) before the in-progress send_frame()
+  // for the previous report had finished writing all its bytes,
+  // interleaving two frames' bytes on the wire. Measured impact was
+  // negligible anyway (matches the ~350us << 10ms observed report
+  // period), so not worth the risk - back to the safe order: fully
+  // transmit, then re-arm.
+  if (len > 512) {
+    len = 512;
+  }
+  send_frame(BRIDGE_MSG_REPORT, dev_addr, idx, itf_protocol, report, len);
   tuh_hid_receive_report(dev_addr, idx);
-
-  send_frame(BRIDGE_MSG_REPORT, dev_addr, idx, itf_protocol, local_report, copy_len);
 }
