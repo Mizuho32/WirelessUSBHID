@@ -140,11 +140,29 @@ Phase1の最後のステップ(`hid_report_parser.c`/`filter_rules.h`/`protocol.
 
 **9ボタンマウスの3バイート切り詰めquirk対応コード(`last_boot_consumer_usage`)は移植していない** — TinyUSB経由では実機で7バイート丸ごと正しく届くことを確認済みなので不要と判断(ただし実際の9ボタンマウス実機での再確認はまだ)。
 
-### 未実装(次ステップ)
-- **UDP → Device role基板の疎通確認・デバッグ(最優先、実施中)** - 実機ログで原因切り分け中
+### ハマった沼: 手動SET_PROTOCOLの二重リクエストが3バイート化の真因だった
+
+実機テストで断続的に3バイートレポートが再発。何段階か仮説を試したが遠回りだった(結果的に無駄だった経緯として残す):
+1. 「TinyUSBのデフォルトプロトコル取り忘れ」仮説 → 実は取得済みで無関係
+2. 「`tuh_hid_set_protocol()`が非同期なのでreceive_report開始が早すぎる」仮説 → completion callback(`tuh_hid_set_protocol_complete_cb`)で同期化したが直らず
+3. **最終的にユーザーの指摘で気づいた根本原因**: dump-onlyの動作実績があるバージョン(コミット`a6a5301`)を基準に「そこから何が変わったか」で差分を見直すべきだった。差分は「`tuh_hid_mount_cb`内でマウス用に手動`tuh_hid_set_protocol(Report)`を追加で呼んでいたこと」——列挙時の自動SET_PROTOCOL(`tuh_hid_set_default_protocol()`+`CFG_TUH_HID_SET_PROTOCOL_ON_ENUM`、デフォルト有効)と合わせて**同じ内容のリクエストを2回**送っていたことになる。このドングルはSET_PROTOCOL周りが元々怪しい(`mds/2026-08-22_wireless_dongle_short_reports.md`)ので、重複リクエストで一時的にBoot形状のレポートを吐いていた可能性が高い。
+
+対処: 手動の`tuh_hid_set_protocol()`呼び出しを完全に削除し、dump-onlyバージョンが実際にやっていた「自動の1回だけ」に戻した。dispatch/parsingロジックはそのまま追加。実機で7バイート確認できたので、これで確定とする。
+
+**教訓**: 動作実績のあるコードがある時は、そこからの差分(diff)で原因を絞るべきで、仮説を積み重ねて後付けで修正していくのは遠回りになりやすい。
+
+### 現状: 依然不安定(保留中)、Device roleに届いても操作できないことがある
+
+7バイートのレポート自体は安定して来るようになったが、**MAX3421側の通信自体が時々乱れる**(unmount、`[1:1] raw report (0 bytes):`という長さ0のレポートが混ざる、等)。この状態のとき、Device role側にUDPが届いてもPC操作ができないことがある一方、Device role基板をリセットすると復活する、との報告あり。
+
+0バイートのレポート自体は`handle_keyboard_report`/`handle_mouse_report_boot`が長さチェックで弾く(`length < sizeof(...)`で早期return)ので、それ単体がDevice側を壊す直接原因ではないはず。**より疑わしい仮説**: 同じ通信の乱れの最中に、長さは正常だが中身が化けたレポート(garbage but non-zero length)が紛れ込み、たまたま「何らかのキーが押された」ように解釈されて`hid_forwarder_keyboard_report()`経由で送信され、UDPプロトコルは差分ではなく毎回フルステート送信なので、その後に正しい(キー解放)レポートが届かない限りDevice側はそのキーを押しっぱなしと認識し続ける——Device roleのリセットで直る、という報告と整合する。
+
+根本原因はSPI/配線の信号品質(mount/unmount不安定さと同根)である可能性が高く、これ自体は引き続き保留。git履歴は`a6a5301`から今回のコミットまでを1つに整理(squash)した。
+
+### 未実装・保留(次ステップ)
+- **MAX3421の通信不安定さの根本解決(保留中)** - 電源・SPIクロック(現状5MHz)は試したが未解決。最悪RP2040をUSB Hostとして使う代替案あり
 - type-c直結Device出力(将来対応、優先度は下げた)
 - SPIプローブによるMAX3421自動検出→バックエンド選択(現状は無条件で両方起動)
-- MAX3421のunmount不安定さの根本解決(保留中、最悪RP2040をUSB Hostとして使う代替案あり)
 - 9ボタンマウス実機での再確認(quirk無しで本当に問題ないか)
 - Hub経由の複数デバイス確認(`mds/2026-08-22_multi_device.md`の要件)
 
