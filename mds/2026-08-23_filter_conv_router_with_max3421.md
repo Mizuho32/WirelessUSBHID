@@ -116,6 +116,13 @@ ESP32S3-Plus標準SPIピン(MOSI=GPIO9 / MISO=GPIO8 / SCLK=GPIO7)+ CS=GPIO4 / RS
 
 その後「MAX3421 unmountがすぐ起きて不安定」という報告あり。VBUS(5V)・MAX3421 VCC(3.3V)は共に配線済みと確認済みなので、電源不足ではなく**SPIクロック(当初10MHz)がブレッドボード配線には速すぎた**線が濃厚と判断し、`MAX3421_SPI_CLOCK_HZ`を1MHzまで下げた。HIDは元々低帯域なので速度を犠牲にする価値は十分にある。この不安定さの根本解決は保留にして先に進む方針(最悪RP2040をUSB Hostとして使う代替案あり)。
 
+### 訂正: 出力先は「UDP → 既存Device role基板」のみ実装、type-c直結は未着手
+要件の「HID機器 → MAX3421 → filter/conv/route → ESP32 type-c (device) or UDP」のうち、ここまで実装したのは**UDP側のみ**。「MAX3421を積んだこのESP32自身のtype-cをDevice化してPCに直結する」方は**まだ何もしていない**(以前の記述で実装済みであるかのように読める部分があったが誤り、訂正)。
+
+この2つは実装として結構違う: type-c直結には、MAX3421がHostを担う分空いているネイティブUSB-OTGペリフェラルをDeviceモードで使う必要があり、`components/tinyusb`をDevice+Host両対応(dual rhport)でビルドし直す必要がある(現状のKVM_ROLE=HOST分岐はHost専用ファイルしか含めていない)。
+
+**優先順位を確認: 両方将来的に欲しいが、まずは動作確認のためUDP → 既存Device role基板の疎通を優先。type-c直結は後回し。**
+
 ## Phase1 完了: `hid_forwarder.c`への集約 + `usb_host_max3421.c`の本実装
 
 Phase1の最後のステップ(`hid_report_parser.c`/`filter_rules.h`/`protocol.h`への接続)を実施。
@@ -134,6 +141,8 @@ Phase1の最後のステップ(`hid_report_parser.c`/`filter_rules.h`/`protocol.
 **9ボタンマウスの3バイート切り詰めquirk対応コード(`last_boot_consumer_usage`)は移植していない** — TinyUSB経由では実機で7バイート丸ごと正しく届くことを確認済みなので不要と判断(ただし実際の9ボタンマウス実機での再確認はまだ)。
 
 ### 未実装(次ステップ)
+- **UDP → Device role基板の疎通確認・デバッグ(最優先、実施中)** - 実機ログで原因切り分け中
+- type-c直結Device出力(将来対応、優先度は下げた)
 - SPIプローブによるMAX3421自動検出→バックエンド選択(現状は無条件で両方起動)
 - MAX3421のunmount不安定さの根本解決(保留中、最悪RP2040をUSB Hostとして使う代替案あり)
 - 9ボタンマウス実機での再確認(quirk無しで本当に問題ないか)
