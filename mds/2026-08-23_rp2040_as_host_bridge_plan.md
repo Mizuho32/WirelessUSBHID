@@ -73,3 +73,26 @@ UART(単純な調歩同期、バイト単位で自己クロック)はSPI(複数�
 - `mds/2026-08-22_rp2040_host_check.md`: RP2040でこのドングルが7バイート届くことを実証済みの記録(VBUSジャンパーの詳細等も含む)
 - `mds/2026-08-23_filter_conv_router_with_max3421.md`: MAX3421方式の実装記録・既知の不安定さ・type-c Device出力(Phase2)の実装内容
 - `rp2040_host_check/rp2040_host_check.ino`: 拡張のベースになる既存スケッチ
+
+## 実装結果(ビルド確認済み、実機未検証)
+
+上記の計画通りソフト側を実装した。
+
+- `rp2040_host_bridge/rp2040_host_bridge.ino`(新規スケッチ): `rp2040_host_check.ino`のmount/report_receivedコールバックはほぼそのまま(`tuh_hid_interface_protocol()`で判定したitf_protocolを添えて)、ダンプ先をテキストではなく上記のバイナリフレームに変更。`loop()`内で500ms間隔のHEARTBEATも送信(プローブ用)。
+- `esp32-kvm-ip/main/usb_host_rp2040_bridge.c`/`.h`(新規): UART受信のバイト単位ステートマシン(`feed_byte`)+ `usb_host_max3421.c`とほぼ同じデバイス種別判定・記述子パース・ディスパッチロジック(ただし`tuh_hid_itf_get_info()`の代わりにフレームの`itf_protocol`フィールドを使う)。TinyUSB Host/SPI関連のコードは一切なし。`usb_host_max3421_probe()`と対になる`usb_host_rp2040_bridge_probe()`(HEARTBEATフレームを最大800ms待つ)・`usb_host_rp2040_bridge_task_start()`を実装。
+- `main_host.c`: バックエンド選択をRP2040ブリッジ→MAX3421→native OTGフォールバックの3択に変更。RP2040かMAX3421のどちらかが使われる場合のみtype-c Device出力(`usb_device_typec_start()`)を起動。
+
+### ハマった沼: `esp_driver_uart`だけCMakeの`PRIV_REQUIRES`が効かない
+
+`main/CMakeLists.txt`のHost role分`PRIV_REQUIRES`に`esp_driver_uart`を追加しても、`usb_host_rp2040_bridge.c`の`#include "driver/uart.h"`が`fatal error: driver/uart.h: No such file or directory`で失敗し続けた。同じリストに並んでいる`esp_driver_gpio`/`esp_driver_spi`は問題なく解決されるのに、`esp_driver_uart`だけ解決されない。
+
+切り分けた内容:
+- `rm -rf build.host`からの完全リビルド・`idf.py reconfigure`でも再現(キャッシュの問題ではない)
+- リストの順番を変えても無関係
+- `esp_driver_uart`の代わりに古い`driver`コンポーネントを指定しても無関係(そもそも`driver`は今のESP-IDFではI2C/touch/TWAIの残骸で、UARTとは無関係と判明)
+- `build.host/project_description.json`の`main`の`priv_reqs`を直接見ると、実際に`esp_driver_spi`すら載っていない(なのに実際のコンパイルコマンドには`-I .../esp_driver_spi/include`が存在する)——つまりこのjsonの`priv_reqs`表示自体がCMakeLists.txtの内容を正しく反映していない(idf.pyの依存関係ヒント機能`tools/idf_py_actions/hint_modules/component_requirements.py`が使っているのと同じデータ)。しかし実際のコンパイルコマンド(`ninja -t commands`で確認)では`esp_driver_spi`は`-I`に載るのに`esp_driver_uart`だけ載らない、という非対称な現象だった。
+- `esp_driver_uart`自体のビルド(`libesp_driver_uart.a`)は問題なく成功しており、コンポーネント自体は正常。
+
+原因はESP-IDF 6.0のコンポーネント要件解決まわりの何らかの非対称な挙動(esp_driver_uartのCMakeLists.txtが持つ`CONFIG_VFS_SUPPORT_IO`時の追加`target_link_libraries(idf::vfs)`が怪しいが未確定)と思われるが、深追いを止めて対処療法に切り替えた。
+
+**対処**: `idf_component_register()`の`PRIV_REQUIRES`に頼らず、登録直後に`target_link_libraries(${COMPONENT_LIB} PRIVATE idf::esp_driver_uart)`を明示的に追加することで解決。ビルド確認済み(Host role・Device role とも警告0件)。
