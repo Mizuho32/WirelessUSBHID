@@ -8,14 +8,17 @@
 void setup() {
   Serial.begin(115200);
   Serial1.begin(115200);
+  Serial2.begin(115200);
   Serial.println("Setup from RP2040! 0");
   Serial1.println("Setup from RP2040! 1");
+  Serial2.println("Setup from RP2040! 2");
   pinMode(LED_BUILTIN, OUTPUT);
 }
 
 void loop() {
   Serial.println("Hello from RP2040! 0");
   Serial1.println("Hello from RP2040! 1");
+  Serial2.println("Hello from RP2040! 2");
   digitalWrite(LED_BUILTIN, HIGH);
   delay(500);
   digitalWrite(LED_BUILTIN, LOW);
