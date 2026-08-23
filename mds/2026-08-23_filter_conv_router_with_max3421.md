@@ -105,6 +105,11 @@ target_include_directories(${COMPONENT_LIB} BEFORE PRIVATE "host_config")
 - `esp32-kvm-ip/components/tinyusb/`: 上記のローカルoverride component(`managed_components/espressif__tinyusb`のコピー + Host role用`srcs`分岐 + `host_config/tusb_config.h`)
 - `esp32-kvm-ip/main/usb_host_max3421.c`/`.h`: SPI+GPIOグルー実装 + Phase1スモークテスト(`tuh_hid_mount_cb`/`report_received_cb`で記述子・生レポートをそのままログ出力するだけ、`rp2040_host_check.ino`と同じ発想)。`main_host.c`から既存のnative OTGパス(`usb_host_task_start()`)と**並行して無条件に**呼ぶようにした(失敗しても非致命的 - ログを出して続行するだけ)。ピン配置(`MAX3421_PIN_*`)はプレースホルダなので実配線に合わせて要調整。
 
+### ピン配置(`main/usb_host_max3421.c`) - 実配線に合わせて確定
+ESP32S3-Plus標準SPIピン(MOSI=GPIO9 / MISO=GPIO8 / SCLK=GPIO7)+ CS=GPIO4 / RST=GPIO5 / INT=GPIO6。デバッグ出力は引き続きUART0(GPIO43/44, D6/D7)で衝突なし。
+- **INT**(GPIO6): MAX3421EのINTはオープンドレイン・Lowアクティブ - 直結でOK(コード側で内部プルアップ+立ち下がりエッジ割り込みを設定済み)。
+- **RST**(GPIO5): RESETもLowアクティブ。コード側で起動時に「Low 10ms → High 10ms待ち」のリセットパルスを打つように実装済み(発振器安定待ち)。フローティングにしないこと。
+
 ### 未実装(実機確認後の次ステップ)
 - SPIプローブによるMAX3421自動検出→バックエンド選択(現状は無条件起動。ハード未配線でも安全だが、正式なフォールバック判定ではない)
 - `hid_report_parser.c`/`filter_rules.h`/`protocol.h`への接続(現状はダンプのみ)
