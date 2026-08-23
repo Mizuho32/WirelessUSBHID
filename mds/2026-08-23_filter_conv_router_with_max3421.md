@@ -162,8 +162,41 @@ Phase1の最後のステップ(`hid_report_parser.c`/`filter_rules.h`/`protocol.
 ### 未実装・保留(次ステップ)
 - **MAX3421の通信不安定さの根本解決(保留中)** - 電源・SPIクロック(現状5MHz)は試したが未解決。最悪RP2040をUSB Hostとして使う代替案あり
 - type-c直結Device出力(将来対応、優先度は下げた)
-- SPIプローブによるMAX3421自動検出→バックエンド選択(現状は無条件で両方起動)
-- 9ボタンマウス実機での再確認(quirk無しで本当に問題ないか)
-- Hub経由の複数デバイス確認(`mds/2026-08-22_multi_device.md`の要件)
+- ~~SPIプローブによるMAX3421自動検出→バックエンド選択~~ → Phase2で実装(下記)
+- 9ボタンマウス実機での再確認(quirk無しで本当に問題ないか) → 実機確認済み、問題なし
+- Hub経由の複数デバイス確認(`mds/2026-08-22_multi_device.md`の要件) → 実機確認済み、問題なし
 
 ## Phase2 route/filterの詳細を詰める
+### 要件
+- MAX3421がなければネイティブOTGでHost
+  - あればMAX3421を使う
+  - UDPに送信
+---- ここまでの実装。追加で↓ ---
+- type-cがPCに接続されたら、filter/convはかけたうえでtype-cに送信
+  - routeルールに書いたものだけUDP送信
+- type-c未接続ならこれまで通りUDP送信
+
+### 実装: MAX3421自動検出→バックエンド選択(排他)
+
+`usb_host_max3421_probe()`(新設、`usb_host_max3421.c`/`.h`)を追加。`main_host.c`起動時にこれを1回呼び、結果でどちらか一方のバックエンドだけを起動する(両方同時には起動しない)。
+
+- 中身: GPIO/SPI初期化(`max3421_spi_gpio_init`/`max3421_spi_bus_init` - 既存のtask起動時init処理を`max3421_ensure_bus_initialized()`という共有ヘルパーに切り出し、probeとtaskの両方から呼べるようにした。2回目はno-op)→ MAX3421EのREVISIONレジスタ(アドレス`18u<<3`、`hcd_max3421.c`内部の`REVISION_ADDR`と同じ)を生SPIで読み、`hcd_init()`自身が使っているのと同じ判定(`0x01`/`0x12`/`0x13`のいずれか)で存在確認する。
+- `tuh_max3421_reg_read()`(ドライバが公開している同等ヘルパー)を使わなかった理由: 内部で`_hcd_data.spi_mutex`をロックするが、そのmutexは`hcd_init()`内で初めて作られる。probeの時点ではまだ`tuh_rhport_init()`(→`hcd_init()`)を呼んでいないので、未初期化のmutexを触ることになり危険。そのため`tuh_max3421_spi_cs_api`/`spi_xfer_api`を直接呼んで同じ2バイート転送を自前で組んだ。
+- `main_host.c`: `usb_host_max3421_probe()`→true なら`usb_host_max3421_task_start()`のみ、false なら`usb_host_task_start()`(native OTG)のみを起動するよう変更(以前の「両方無条件起動」を置き換え)。これでMAX3421が繋がっている時はnative OTGペリフェラルが完全に未使用のまま空くので、次のtype-c直結出力の前提が整った。
+- ビルド確認: Host role・Device role とも警告0件でビルド通過(実機再検証はこれから)。
+
+注意点として、フローティングバスがたまたま`0x01`/`0x12`/`0x13`のいずれかのバイトを返すと誤検出しうる(この配線で「電源切ってるはずなのにデータが来た」報告があった件と同種のリスク)が、これは`hcd_init()`自身の判定ロジックと全く同じなので、ドライバ本体が元々抱えているのと同じ程度のリスクに留まる。
+
+### 実装: type-c直結Device出力 + route_rules(ビルド確認済み、実機未検証)
+
+MAX3421Eが繋がっている(=native OTGが空いている)場合に限り、そのnative OTGポートをUSB HID Deviceとして起動し、PCに直結できるようにした。
+
+**TinyUSBのdual rhport化**: `components/tinyusb/host_config/tusb_config.h`を「rhport0 = Device(native OTG)、rhport1 = Host(MAX3421E)」の2ポート構成に変更(`CFG_TUSB_RHPORT0_MODE`/`CFG_TUSB_RHPORT1_MODE`をそれぞれ設定)。TinyUSBはこの手のボード(1つの物理コントローラ + 1つの追加コントローラ)向けにこの2ポート方式を元々サポートしている(RP2040+PIO-USBの構成などと同型)。`MAX3421_RHPORT`は0→1に変更。`components/tinyusb/CMakeLists.txt`のHOST側`srcs`にDevice側ソース(`hid_device.c`/`dcd_dwc2.c`/`dwc2_common.c`/`usbd.c`)を追加(Host用ファイルと排他ではなく追加)。KVM_ROLEは相変わらずビルド時選択なので、この2ポート構成自体は常にコンパイルされるが、実際にどちらを初期化するかは`main_host.c`が実行時に決める(MAX3421E無しの場合はrhport0もrhport1も初期化せず、代わりにESP-IDF自前の`usb_host_hid`スタックでnative OTGをHostとして使う、という以前からの分岐のまま)。
+
+**新規`main/usb_device_typec.c`/`.h`**: `main/usb_descriptors.c`(Device roleと共有、同じ3インターフェース記述子)を使って`espressif/esp_tinyusb`の`tinyusb_driver_install()`を呼ぶだけ(`main.c`のDevice role初期化とほぼ同じ)。手組みのPHY初期化+`tud_rhport_init()`ではなくこちらを選んだ理由: `tud_descriptor_device_cb()`等はesp_tinyusbの`descriptors_control.c`(`main/idf_component.yml`によりKVM_ROLEに関係なく常にコンパイルされる)側にしか実体がなく、`tinyusb_driver_install()`経由でしかその中身(`s_desc_cfg`)が埋まらない - 自前で同名コールバックを書くとシンボル重複で衝突する。なお、これは以前ハマった「tusb_config.hの奪い合い」とは別の話 - どのtusb_config.hが勝つかは`components/tinyusb/CMakeLists.txt`のビルド時`target_include_directories(... BEFORE ...)`で決まっており、実行時にどの関数(`tinyusb_driver_install()` vs 自前実装)を呼ぶかとは無関係。
+
+**`main_host.c`**: `usb_host_max3421_probe()`がtrueのブランチでのみ`usb_device_typec_start()`を追加で呼ぶ(失敗しても非致命的、UDPのみで継続)。
+
+**route_rules(新設、`main/route_rules.h.example`+`route_rules_default.h`)**: `filter_rules.h`と全く同じ「gitignoreされた個人コピー、トラッキングされたデフォルトにフォールバック」パターン。デフォルトは全部`false`(type-c接続時は明示的にリストしたものだけUDPにも流す、要件通り)。`hid_forwarder.c`が`usb_device_typec_connected()`(`tud_mounted()`のラッパ)を見て、接続中なら「type-cへ送信 + route_rulesがtrueならUDPにも」、未接続なら「今まで通りUDPのみ」に分岐。キーボードのマージ状態計算(`compute_merged_keyboard_report`)を送信ロジックから分離し、type-c/UDP両方の送信元で共有。
+
+**ビルド確認**: Host role・Device role とも警告0件でビルド通過。実機での動作確認(type-c直結時にPCがキーボード/マウスとして認識するか、MAX3421経由の入力が実際に転送されるか)はこれから。
