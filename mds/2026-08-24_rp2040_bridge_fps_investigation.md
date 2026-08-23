@@ -62,7 +62,62 @@
 
 無線リンク側のポーリングレートが上限だった場合、ソフトウェア側でできることはない。この場合は「今のドングルではこれが限界」と割り切るか、別のワイヤレスマウス/レシーバーに変える、という話になる。
 
+## 実測結果(2026-08-24)
+
+上記の切り分け案を実装し、順に潰していった記録。
+
+### 1. type-c送信側の`tud_hid_n_report()`失敗は0
+
+`usb_device_typec.c`の`wait_for_ready()`に加えて、`tud_hid_n_report()`自体が(`wait_for_ready()`成功後でも)`false`を返すケースをカウントする`submit failures/sec`を追加。結果は常に0——「待った後に実は送信自体が失敗して無音に消えている」説は却下。
+
+```
+USBDEV_TYPEC: [rate] wait_for_ready: 102 calls/sec, 79 blocked/sec, 79 ms blocked/sec, 0 submit failures/sec
+```
+
+`blocked`が呼び出しの大半を占める点も、フルスピードUSBの1msフレーム境界に対する平均的な待ち(理論上避けられないオーバーヘッド)として説明がつき、それ自体は異常ではないと判断。
+
+### 2. 決定的な手がかり: バースト配信
+
+`usb_host_rp2040_bridge.c`に「連続する2フレームの最短/最長間隔」を追加したところ:
+
+```
+USBHOST_RP2040BRIDGE: [rate] 102 reports/sec, 0 checksum failures/sec, 0 queue drops/sec, min interval 13us, max interval 49992us
+```
+
+平均は~100Hzで健全に見えるのに、**最短間隔が13μs**(460800bpsの1バイト転送時間21.7μsより短い)——「均等に~10ms間隔で届く」のではなく、**しばらく詰まって溜まった分を一気に処理している**ことの直接証拠。人間の目には「静止→まとめてジャンプ」の繰り返しに見え、静止期間の長さの逆数が体感フレームレートになる(50ms周期の静止なら~20Hz、という具合に、当初の「10, 20Hz前後」という見立てとも整合する)。
+
+### 3. WiFi省電力モードを疑ったが外れ
+
+有力容疑者として、ESP32 STAのデフォルト省電力モード(`WIFI_PS_MIN_MODEM`、AP のDTIM間隔ごとにしかスリープから起きず、起床時にWiFiドライバの高優先度タスクが数msCPUを占有しうる)を疑い、`wifi_manager.c`に`esp_wifi_set_ps(WIFI_PS_NONE)`を追加。
+
+→ **効果なし**。同じ`max interval ~50ms`が再現した。
+
+### 4. RP2040自体は無罪と確定
+
+RP2040の`Serial2`デバッグ出力を(ESP32を介さず)直接確認したところ:
+
+```
+[rp2040-rate] 100 reports/sec, min interval 9996us, max interval 10003us
+```
+
+ジッター0.1%未満の完璧な~10ms周期。**RP2040のTinyUSB Host処理・マウス・ドングルはすべて無罪**——バーストはESP32側で発生していることが確定した。(のちにこの数値をESP32のコンソールにも出せるよう、`BRIDGE_MSG_STATS`という新しいフレーム種別を追加し、RP2040がSerial1経由で自分の統計値もESP32に転送するようにした——専用のUSBシリアルアダプタなしでも同じログで両方見えるようにするため。)
+
+### 5. `bridge_task`自身のスケジューリング欠落を直接証明
+
+`bridge_task`の`while(1)`ループ1周ごとの実時間ギャップを計測したところ:
+
+```
+USBHOST_RP2040BRIDGE: [rate] 78 reports/sec, 0 checksum failures/sec, 0 queue drops/sec, min interval 13us, max interval 49964us, max loop gap 50033us
+```
+
+`max loop gap`(50033μs)と`max interval`(49964μs)がほぼ完全に一致——**`bridge_task`が約50ms、実行可能な状態のままCPUを貰えていない**ことが直接証明された。RP2040が10msごとに律儀にデータを送ってきている以上、これは「データが来ていない」のではなく「タスクが動けなかった」ことを意味する。WiFi省電力は無関係と分かった後なので、真の犯人(WiFi/lwIPの別の内部処理、USB割り込み負荷、その他)はまだ特定できていない。
+
+### 6. 次の一手: FreeRTOSランタイム統計(実施済み、結果待ち)
+
+犯人のタスクを直接特定するため、`sdkconfig`で`CONFIG_FREERTOS_USE_TRACE_FACILITY`/`CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS`を有効化し、`bridge_task`のループギャップが5ms を超えた時だけ`vTaskGetRunTimeStats()`の出力をログに追加した。次にこれを実機で見て、どのタスクがCPU時間を食っているか特定する。
+
 ## まとめ・次のアクション
 
-1. まず上記「切り分けのための実測案」を実装して、RP2040・UART・送信側それぞれの実効レートを数字で確認する(推測で選択肢A〜Cのどれかに飛びつく前に)。
-2. 数字が出たら、ボトルネックが実際にどこにあるかに応じて選択肢A〜Dのどれを取るか決める。
+1. ~~切り分けのための実測案を実装~~ → 完了。ボトルネックは「RP2040→UART→ESP32のバースト配信」で、原因は**RP2040ではなくESP32側のタスクスケジューリング**(WiFi省電力ではない何か)と確定。
+2. 次: `vTaskGetRunTimeStats()`のログを見て、CPUを食っている犯人タスクを特定する。
+3. 犯人が分かったら、その処理自体を軽くする/優先度を調整する/頻度を下げる、といった対症療法を検討(選択肢A〜Dは「RP2040やUART自体がボトルネックだった場合」の話だったので、この結果を受けて優先度を下げる——ブリッジそのものは無罪なので、選択肢Aの「ブリッジを無くす」は的外れになった)。
