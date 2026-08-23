@@ -33,6 +33,13 @@ Adafruit_USBH_Host USBHost;
 #define BRIDGE_MSG_MOUNT      0x02
 #define BRIDGE_MSG_UNMOUNT    0x03
 #define BRIDGE_MSG_REPORT     0x04
+// RP2040-side RATE_MONITOR stats, sent over the same Serial1 link so
+// they show up in the ESP32's own console log without needing a
+// separate USB-serial adapter on Serial2 - see the RATE_MONITOR comment
+// below. Payload: 3x uint32 LE (reports_per_sec, min_interval_us,
+// max_interval_us) - safe to memcpy as a struct since both RP2040 (ARM,
+// Cortex-M0+) and ESP32-S3 (Xtensa) are little-endian.
+#define BRIDGE_MSG_STATS      0x05
 #define BRIDGE_BAUD           460800
 
 #define HEARTBEAT_INTERVAL_MS 500
@@ -117,6 +124,7 @@ static uint32_t s_report_count;
 // software-side stall being the real ceiling instead.
 static uint32_t s_last_report_us;
 static uint32_t s_min_interval_us;
+static uint32_t s_max_interval_us; // the "quiet gap" size, if delivery is bursty
 #endif
 
 static uint32_t last_heartbeat_ms;
@@ -277,10 +285,20 @@ void loop() {
       last_rate_print_ms = now;
       uint32_t count = s_report_count;
       uint32_t min_interval = s_min_interval_us;
+      uint32_t max_interval = s_max_interval_us;
       s_report_count = 0;
       s_min_interval_us = 0;
-      DEBUG_PRINTF("[rate] %lu reports/sec, min interval %luus\r\n",
-                    (unsigned long)count, (unsigned long)min_interval);
+      s_max_interval_us = 0;
+      DEBUG_PRINTF("[rate] %lu reports/sec, min interval %luus, max interval %luus\r\n",
+                    (unsigned long)count, (unsigned long)min_interval, (unsigned long)max_interval);
+
+      // Also send as a BRIDGE_MSG_STATS frame over the same Serial1 link
+      // to the ESP32 - shows up in its console log
+      // (usb_host_rp2040_bridge.c logs it directly under an
+      // "[rp2040-rate]" tag) without needing a second USB-serial adapter
+      // wired to Serial2 just to see these numbers.
+      uint32_t stats_payload[3] = { count, min_interval, max_interval };
+      send_frame(BRIDGE_MSG_STATS, 0, 0, 0, (const uint8_t *)stats_payload, sizeof(stats_payload));
     }
   }
 #endif
@@ -370,6 +388,9 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t idx, const uint8_t *re
       uint32_t interval = now_us - s_last_report_us;
       if (s_min_interval_us == 0 || interval < s_min_interval_us) {
         s_min_interval_us = interval;
+      }
+      if (interval > s_max_interval_us) {
+        s_max_interval_us = interval;
       }
     }
     s_last_report_us = now_us;
