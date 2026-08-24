@@ -112,12 +112,76 @@ USBHOST_RP2040BRIDGE: [rate] 78 reports/sec, 0 checksum failures/sec, 0 queue dr
 
 `max loop gap`(50033μs)と`max interval`(49964μs)がほぼ完全に一致——**`bridge_task`が約50ms、実行可能な状態のままCPUを貰えていない**ことが直接証明された。RP2040が10msごとに律儀にデータを送ってきている以上、これは「データが来ていない」のではなく「タスクが動けなかった」ことを意味する。WiFi省電力は無関係と分かった後なので、真の犯人(WiFi/lwIPの別の内部処理、USB割り込み負荷、その他)はまだ特定できていない。
 
-### 6. 次の一手: FreeRTOSランタイム統計(実施済み、結果待ち)
+### 6. FreeRTOSランタイム統計(1回目、累積値): 手がかりなし
 
-犯人のタスクを直接特定するため、`sdkconfig`で`CONFIG_FREERTOS_USE_TRACE_FACILITY`/`CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS`を有効化し、`bridge_task`のループギャップが5ms を超えた時だけ`vTaskGetRunTimeStats()`の出力をログに追加した。次にこれを実機で見て、どのタスクがCPU時間を食っているか特定する。
+`sdkconfig`で`CONFIG_FREERTOS_USE_TRACE_FACILITY`/`CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS`を有効化し、`bridge_task`のループギャップが5msを超えた時だけ`vTaskGetRunTimeStats()`の出力をログに追加。結果:
 
-## まとめ・次のアクション
+```
+usb_host_rp2040 705264          4%
+IDLE1           16643409                95%
+IDLE0           16413964                93%
+tcpip           15309           <1%
+wifi            272614          1%
+TinyUSB         195335          1%
+```
 
-1. ~~切り分けのための実測案を実装~~ → 完了。ボトルネックは「RP2040→UART→ESP32のバースト配信」で、原因は**RP2040ではなくESP32側のタスクスケジューリング**(WiFi省電力ではない何か)と確定。
-2. 次: `vTaskGetRunTimeStats()`のログを見て、CPUを食っている犯人タスクを特定する。
-3. 犯人が分かったら、その処理自体を軽くする/優先度を調整する/頻度を下げる、といった対症療法を検討(選択肢A〜Dは「RP2040やUART自体がボトルネックだった場合」の話だったので、この結果を受けて優先度を下げる——ブリッジそのものは無罪なので、選択肢Aの「ブリッジを無くす」は的外れになった)。
+`IDLE0`/`IDLE1`が93-95%で、他は全部<1%——起動からの**累積時間**で見ているせいで、17秒の稼働時間の中の50-100ms程度のスパイクは1%未満に埋もれて他タスクのノイズと区別がつかない。この方式では解像度不足と判明。
+
+### 7. FreeRTOSランタイム統計(2回目、差分値): それでも犯人不在
+
+`uxTaskGetSystemState()`を毎回スナップショットし、直前との**差分**(直近~1秒間の消費時間)を見るよう変更。結果:
+
+```
+loop gap 103134us - per-task CPU delta over last ~1s:
+  usb_host_rp2040  57864us
+  usb_host_rp2040  6140us
+  IDLE1            1014030us
+  IDLE0            956462us
+  tcpip            410us
+  esp_timer        139us
+  wifi             2168us
+  TinyUSB          2226us
+```
+
+`IDLE0`/`IDLE1`が合計で2秒間(2コア分)近くを占有——**この1秒間、CPUはほぼ完全にアイドルだった**。つまり「他のタスクがCPUを奪っている」という説自体がここで崩れる。何も動いていないのに`bridge_task`だけが起きられていない。
+
+(この段階で診断ログの出力量が増えるほど`max loop gap`の値も大きくなっている(~50ms→~103ms)ことに気づき、「測定ログ自体が犯人では」と疑って`BRIDGE_RATE_MONITOR`/`USB_DEVICE_TYPEC_RATE_MONITOR`を全部OFFにして試したが、**症状は変わらず**——ログ自体が原因という説もここで却下。)
+
+### 8. 最小構成での切り分け: WiFi/type-c/dispatch_taskを全部消しても再現
+
+WiFi・`hid_forwarder`(UDPソケット)・type-c USB Device出力・`dispatch_task`を`#ifdef`で全部無効化し、`bridge_task`(UART解析+カウントのみ)だけが動く構成でテスト(`HOST_MINIMAL_TEST`/`BRIDGE_MINIMAL_TEST`)。バイナリサイズが995KB→440KBまで縮み、実際にそれらのサブシステムが除外されていることを確認した上で:
+
+```
+[rate] 103 reports/sec, 0 checksum failures/sec, 103 queue drops/sec, min interval 9us, max interval 49980us, max loop gap 56299us
+  usb_host_rp2040  39897us
+  IDLE1            1021000us
+  IDLE0            990106us
+```
+
+**それでも同じ規模のバーストが再現**。WiFi・lwIP・TinyUSB Device・`dispatch_task`、全部無罪。残るはアプリケーション層より下——`uart_read_bytes()`自体の実装か、割り込みサービスの遅延(タスク単位の統計には出てこない領域)。
+
+### 9. 根本原因確定: `uart_read_bytes()`のタイムアウト値(20ms→1ms)
+
+`bridge_task`の`uart_read_bytes(..., pdMS_TO_TICKS(20))`のタイムアウトを**1msに縮めるだけ**でテストしたところ:
+
+```
+[rate] 100 reports/sec, 0 checksum failures/sec, 101 queue drops/sec, min interval 9000us, max interval 11000us, max loop gap 4623us
+```
+
+**別次元の改善**。`min/max interval`が9000-11000usという、RP2040自身の測定値(9995-10004us)とほぼ同じ健全な~10ms周期に戻り、`max loop gap`も4623usまで縮小。**タイムアウト値を長く(20ms)指定すると、その待ち時間が数倍(最大で5倍以上)に膨らむ何らかの挙動が、ESP-IDFの`uart_read_bytes()`(内部的にはFreeRTOSのリングバッファ+セマフォ待ち)にあった**、というのが最終的な根本原因。WiFi省電力オフ・ログ削減・タスク分離など、それまで試した対策が軒並み効かなかったのは、そもそも見当違いの層(アプリケーション層のタスクスケジューリング)を疑っていたため。
+
+最小構成の`HOST_MINIMAL_TEST`/`BRIDGE_MINIMAL_TEST`を元に戻し(WiFi・UDP・type-c・`dispatch_task`を全部復活)、1msタイムアウトの修正だけ残した状態で実機テスト → **体感でも直った**。
+
+### 10. 副次的な問題: 2秒周期の詰まり(解決)
+
+上記の根本修正後、新たに「ちょうど2秒おきに詰まる」症状が出た。原因は`dispatch_mount()`——RP2040側の2秒おきの再アナウンス(`REANNOUNCE_INTERVAL_MS`、ESP32だけ再起動してもマウント状態を見失わないための仕組み)が届くたびに、**毎回無条件で**`ESP_LOGI("HID mounted...")` + レポート記述子のhex dump全部をコンソールに出力していたのが原因。20-100ms級の大きなバグに隠れて見えていなかったが、パイプラインが滑らかになったことで単独で目立つようになった。
+
+`find_mouse_device()`/`find_consumer_device()`で「本当に初回マウントか、再アナウンスか」を区別し、初回のみログを出すよう修正。あわせて今回の調査で追加した診断ログ(`BRIDGE_RATE_MONITOR`/`USB_DEVICE_TYPEC_RATE_MONITOR`/RP2040側`RATE_MONITOR`)も全部OFFにしたクリーンな状態に戻した。
+
+## 結論: 解決済み(2026-08-24)
+
+**根本原因は`usb_host_rp2040_bridge.c`の`bridge_task`が`uart_read_bytes()`に渡していたタイムアウト値(20ms)**——RP2040やマウス/ドングル、WiFi、UDP、type-c USB Device、ログ出力量、いずれも無罪だった。20msという(それ自体は一見妥当に見える)タイムアウト指定が、実際の待ち時間を最大100ms級まで膨らませ、その間にRP2040からの~10ms周期のデータがUART受信バッファに溜まり、再開時に一気に処理される(バースト配信)——これが「100Hz流れているのに体感10-20Hzでしか動いて見えない」の正体だった。
+
+**修正**: タイムアウトを1msに短縮。副次的に見えていた「2秒周期の詰まり」は、`dispatch_mount()`が再アナウンス毎に無条件でログ(hex dump込み)を出していたのが原因で、初回マウント時のみログを出すよう修正して解決。
+
+選択肢A〜D(通信方式変更・ハード実装など)はいずれも的外れだった——ブリッジ(RP2040・UART)は最初から無罪で、問題はESP32側のワンライナー(タイムアウト値)だった。
