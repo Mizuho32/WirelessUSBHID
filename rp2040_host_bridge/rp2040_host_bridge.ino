@@ -2,7 +2,7 @@
 // same proven-working core as rp2040_host_check.ino) and forwards
 // already-decoded HID mount/report events to an ESP32-S3 over a plain
 // UART link, instead of an SPI-attached MAX3421E - see
-// mds/2026-08-23_rp2040_as_host_bridge_plan.md for why (MAX3421E's SPI
+// mds/usb_hid/2026-08-23_rp2040_as_host_bridge_plan.md for why (MAX3421E's SPI
 // protocol turned out sensitive to wiring quality; a UART byte stream is
 // expected to tolerate that much better).
 //
@@ -57,14 +57,14 @@ Adafruit_USBH_Host USBHost;
 //
 // Note the RP2040 board's native USB connector (wherever the dongle is
 // plugged in) is wired directly to the chip's own USB D+/D- pins - see
-// mds/2026-08-22_rp2040_host_check.md - there's no UART bridge behind
+// mds/usb_hid/2026-08-22_rp2040_host_check.md - there's no UART bridge behind
 // it, so it can't be used for debug output at all once acting as Host
 // (same reason Serial1 had to be repurposed for the bridge protocol
 // instead of debug text in the first place).
 #define BRIDGE_DEBUG 0
 
 // Toggle for a running reports/sec counter, printed on Serial2 once a
-// second (mds/2026-08-24_rp2040_bridge_fps_investigation.md measurement
+// second (mds/usb_hid/2026-08-24_rp2040_bridge_fps_investigation.md measurement
 // plan, point 1: how fast is the dongle/tuh_hid_report_received_cb()
 // actually firing, independent of the UART link to the ESP32 or
 // anything downstream of it). This does NOT run on a second core/thread
@@ -77,7 +77,7 @@ Adafruit_USBH_Host USBHost;
 // that across cores would need its own locking and isn't worth it just
 // to print a counter). Separate from BRIDGE_DEBUG's raw hex dumps
 // above: those turned out to be heavy enough to perturb timing while
-// chasing the type-c crash (mds/2026-08-23_rp2040_host_status.md) - an
+// chasing the type-c crash (mds/usb_hid/2026-08-23_rp2040_host_status.md) - an
 // integer increment plus one printf/sec should not have that problem,
 // but keep an eye out.
 #define RATE_MONITOR 0
@@ -112,7 +112,7 @@ static uint32_t s_report_count;
 #if RATE_MONITOR
 // Tracks the shortest gap seen between two consecutive
 // tuh_hid_report_received_cb() calls, reset every print window
-// (mds/2026-08-24_rp2040_bridge_fps_investigation.md follow-up: ESP32
+// (mds/usb_hid/2026-08-24_rp2040_bridge_fps_investigation.md follow-up: ESP32
 // dispatch/UART/type-c submission all measured clean at ~100Hz with no
 // drops, so if this device is actually *capable* of polling faster than
 // that, the ceiling must be here on the RP2040 host side - either the
@@ -135,7 +135,7 @@ static uint32_t last_heartbeat_ms;
 // already mounted here (RP2040 wasn't rebooted), it would otherwise
 // never learn about it at all (REPORT frames keep arriving but never
 // get registered/dispatched on that side - see
-// mds/2026-08-23_rp2040_as_host_bridge_plan.md). Track mounted devices
+// mds/usb_hid/2026-08-23_rp2040_as_host_bridge_plan.md). Track mounted devices
 // here and periodically re-send their MOUNT frame; usb_host_rp2040_bridge.c's
 // registration is idempotent so re-announcing an already-known device
 // is harmless.
@@ -260,7 +260,7 @@ void setup() {
   DEBUG_PRINTF("RP2040 host bridge: starting\r\n");
 
   // Match ESP32's approach (explicit SET_PROTOCOL(Report)) - see
-  // rp2040_host_check.ino / mds/2026-08-22_rp2040_host_check.md.
+  // rp2040_host_check.ino / mds/usb_hid/2026-08-22_rp2040_host_check.md.
   tuh_hid_set_default_protocol(HID_PROTOCOL_REPORT);
 
   USBHost.begin(0);

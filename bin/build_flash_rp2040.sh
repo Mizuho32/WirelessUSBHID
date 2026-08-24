@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build (and optionally flash) an RP2040 Arduino sketch - shared by all
 # rp2040_*/ sketches (rp2040_hello_world/, rp2040_host_check/, ...). See
-# mds/2026-08-22_rp2040_host_check.md.
+# mds/usb_hid/2026-08-22_rp2040_host_check.md.
 #
 # Board = "Raspberry Pi Pico" (confirmed to actually boot on this
 # project's compatible board - a different board id, e.g. "Generic

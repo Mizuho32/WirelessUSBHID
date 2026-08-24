@@ -2,7 +2,7 @@
 // mouse dongle (248a:8579) sends full-length Report Protocol reports
 // (7 bytes, incl. wheel) to an RP2040 acting as USB host, or the same
 // 3-byte Boot-shaped truncation observed on ESP32-S3 - see
-// mds/2026-08-22_rp2040_host_check.md.
+// mds/usb_hid/2026-08-22_rp2040_host_check.md.
 //
 // Requires Tools -> USB Stack -> "Adafruit TinyUSB Host (native)".
 // RP2040 has a single native USB peripheral, so once it's acting as
@@ -17,7 +17,7 @@
 
 Adafruit_USBH_Host USBHost;
 
-// mds/2026-08-24_rp2040_bridge_fps_investigation.md follow-up: isolating
+// mds/usb_hid/2026-08-24_rp2040_bridge_fps_investigation.md follow-up: isolating
 // whether the ~100Hz ceiling measured through rp2040_host_bridge.ino is
 // inherent to this RP2040 hosting this device at all (TinyUSB Host
 // scheduling, or the device's own bInterval), or specific to the

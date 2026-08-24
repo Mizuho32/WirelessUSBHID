@@ -1,6 +1,6 @@
 // Bring-up check for the RP2040 board + toolchain/flash pipeline,
 // before touching the more complex USB Host sketch in
-// rp2040_host_check/ - see mds/2026-08-22_rp2040_host_check.md.
+// rp2040_host_check/ - see mds/usb_hid/2026-08-22_rp2040_host_check.md.
 //
 // Uses the default USB stack (regular USB-CDC Serial, no TinyUSB
 // Host), so this can be verified with the normal Arduino Serial

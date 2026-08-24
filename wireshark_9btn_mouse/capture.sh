@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Capture USB traffic on the bus the Maxxter 9-button mouse dongle is on,
 # to compare its enumeration/control-transfer sequence with what ESP32's
-# usb_host_task.c does. See mds/2026-08-22_wireless_dongle_short_reports.md.
+# usb_host_task.c does. See mds/usb_hid/2026-08-22_wireless_dongle_short_reports.md.
 #
 # Uses tcpdump directly against the kernel's usbmon interface - no
 # Wireshark GUI or tshark needed to CAPTURE (tcpdump has native support

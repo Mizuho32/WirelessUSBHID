@@ -1,7 +1,7 @@
 # Host側のBoot Protocol / Report Protocol整理
 
 ## 経緯
-`mds/2026-08-21_usb_host.md`で実装したHost role(USB Hostとして実機キーボード/マウスを読む)はBoot Protocolのみ対応。wheel握りつぶし・マウス戻る/進む→Alt矢印をfilter/convで書こうとしたら、Boot Protocolにはそもそもwheel/pan、追加ボタン(4番目以降)のデータが存在しないことが判明(`hid_mouse_input_report_boot_t`はbutton1-3 + X/Yの3バイト固定)。
+`mds/usb_hid/2026-08-21_usb_host.md`で実装したHost role(USB Hostとして実機キーボード/マウスを読む)はBoot Protocolのみ対応。wheel握りつぶし・マウス戻る/進む→Alt矢印をfilter/convで書こうとしたら、Boot Protocolにはそもそもwheel/pan、追加ボタン(4番目以降)のデータが存在しないことが判明(`hid_mouse_input_report_boot_t`はbutton1-3 + X/Yの3バイト固定)。
 
 当初「OS起動済みなら拡張HID(Report Protocol)、起動前ならBoot Protocolにfallback」という、Device側(`hid_task.c`)と同じ自動切り替えをHost側にも期待していたが、これは勘違いだった。整理する。
 

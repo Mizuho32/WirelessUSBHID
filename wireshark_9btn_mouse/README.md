@@ -1,6 +1,6 @@
 # 9ボタンマウス(Maxxterドングル)接続初期化キャプチャ
 
-`mds/2026-08-22_wireless_dongle_short_reports.md`の「次にやること」用のツール。Linux PC上でこのドングルを接続する際にOSが実際に送っているUSB制御転送シーケンスをキャプチャし、ESP32側(`esp32-kvm-ip/main/usb_host_task.c`)の初期化シーケンスと比較するため。
+`mds/usb_hid/2026-08-22_wireless_dongle_short_reports.md`の「次にやること」用のツール。Linux PC上でこのドングルを接続する際にOSが実際に送っているUSB制御転送シーケンスをキャプチャし、ESP32側(`esp32-kvm-ip/main/usb_host_task.c`)の初期化シーケンスと比較するため。
 
 ## tcpdumpで十分(Wireshark GUI不要)
 

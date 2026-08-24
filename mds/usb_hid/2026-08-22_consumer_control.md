@@ -13,7 +13,7 @@
 いいえ、どちらも解決不可能ではない。整理すると:
 
 ### チャンネル枯渇はバグの結果であり、ハード上限そのものではない
-`mds/2026-08-22_multi_device.md`で直した「使わないインターフェースまでopenしていた」バグの話であって、**実際に使うインターフェースだけを数えれば**上記の通り8チャンネルに全然余裕がある。メディアキー用インターフェースを1つ追加で開いても5で収まる。
+`mds/usb_hid/2026-08-22_multi_device.md`で直した「使わないインターフェースまでopenしていた」バグの話であって、**実際に使うインターフェースだけを数えれば**上記の通り8チャンネルに全然余裕がある。メディアキー用インターフェースを1つ追加で開いても5で収まる。
 
 ### メディアキー未対応は「未実装」であって「不可能」ではなかった
 `handle_driver_connected()`は`proto == HID_PROTOCOL_NONE`(キーボードのConsumer Controlインターフェースはまさにこれ)のインターフェースを、判定コストすらかけずに`ignoring, not opened`としていた。チャンネル云々ではなく、単に「対応するコードが無かった」だけ。
@@ -27,7 +27,7 @@
 つまりHost側でやるべきことは「物理キーボードのConsumer Controlインターフェースを読んで、同じ`EVENT_TYPE_CONSUMER`パケットとして送る」だけで、**Device側・protocol.h側は無変更**。
 
 ### 9ボタンマウスの方はそもそも無関係
-チャンネル枯渇はマウス1台=1チャンネルという話なので、ボタン数は関係ない。実際の制限はHost側パーサーの`HID_MAX_BUTTONS=8`とDevice側`usb_descriptors.c`の5ボタン固定記述子で、こちらは別タスク(`mds/2026-08-22_multi_device.md`参照、今回は未着手)。
+チャンネル枯渇はマウス1台=1チャンネルという話なので、ボタン数は関係ない。実際の制限はHost側パーサーの`HID_MAX_BUTTONS=8`とDevice側`usb_descriptors.c`の5ボタン固定記述子で、こちらは別タスク(`mds/usb_hid/2026-08-22_multi_device.md`参照、今回は未着手)。
 
 ## 実装上の制約: Report Descriptorはopenしないと読めない
 マウスと違い、Consumer Controlインターフェースは`proto`/`sub_class`だけでは「これがConsumer Controlか、それとも別の未対応ベンダー独自インターフェースか」を判別できない。判別にはReport Descriptorの中身(Usage Page Consumerのフィールドがあるか)を見るしかない。
@@ -87,4 +87,4 @@ AC Pan自体はConsumer Pageの正規のUsage(0x0238)だが「今押されてい
 
 ## 次にやること
 1. もしキーボードの記述子が「1キー1bitビットマップ」型で認識されない場合(ログが`not a recognized Consumer Control layout`になる)、実機ログの記述子ダンプを見て個別対応を検討
-2. 9ボタンマウスの5→8ボタン拡張(別タスク、`mds/2026-08-22_multi_device.md`参照)
+2. 9ボタンマウスの5→8ボタン拡張(別タスク、`mds/usb_hid/2026-08-22_multi_device.md`参照)

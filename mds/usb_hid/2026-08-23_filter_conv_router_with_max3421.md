@@ -20,7 +20,7 @@
 
 `esp32-kvm-ip/managed_components/espressif__tinyusb`(現状 `espressif/tinyusb` v0.21.0、`idf_component.yml`にDevice role用として既に依存済み)のソースツリーを確認したところ、`src/portable/analog/max3421/hcd_max3421.c`が**そのまま入っていた**。TinyUSB本家(hathach/tinyusb)はMAX3421EをSPI経由のHost Controller Driver(HCD)としてサポートしており、Espressifが取り込んでいるツリーにもそのファイル自体は含まれている。
 
-さらに重要なのは、これが**RP2040クロステストで実際に「7バイート丸ごと正しく届く」ことを実機確認済みの、あの`tuh_hid_*` APIと全く同じTinyUSB Hostスタック**だということ(`mds/2026-08-22_rp2040_host_check.md`)。つまりMAX3421採用は単なる「別チップで試してみる」ではなく、**既に正しいと分かっているソフトウェアスタックを、ESP32上でもそのまま使う**という話になる。ESP32-S3のネイティブUSB-OTG(DWC_OTG)+`espressif/usb_host_hid`という組み合わせ固有の問題(4つの仮説を潰してなお原因不明、`mds/2026-08-22_esp_idf_usb_host_known_issues.md`)を、ハードごとバイパスする形になるので、**3バイート切り詰め問題そのものも副次的に解決する可能性が高い**。
+さらに重要なのは、これが**RP2040クロステストで実際に「7バイート丸ごと正しく届く」ことを実機確認済みの、あの`tuh_hid_*` APIと全く同じTinyUSB Hostスタック**だということ(`mds/usb_hid/2026-08-22_rp2040_host_check.md`)。つまりMAX3421採用は単なる「別チップで試してみる」ではなく、**既に正しいと分かっているソフトウェアスタックを、ESP32上でもそのまま使う**という話になる。ESP32-S3のネイティブUSB-OTG(DWC_OTG)+`espressif/usb_host_hid`という組み合わせ固有の問題(4つの仮説を潰してなお原因不明、`mds/usb_hid/2026-08-22_esp_idf_usb_host_known_issues.md`)を、ハードごとバイパスする形になるので、**3バイート切り詰め問題そのものも副次的に解決する可能性が高い**。
 
 必要なボードAPI(アプリ側で実装する関数)はたった3つ:
 ```c
@@ -68,7 +68,7 @@ ESP-IDFの`driver/spi_master.h`(SPIマスター)+ GPIO割り込み(INTピン、M
 2. **TinyUSB Host用コンポーネントの用意**: 本家`hathach/tinyusb`を`third_party/tinyusb`辺りにgit submodule追加し、Host系ソース(`src/tusb.c`, `src/host/usbh.c`, `src/host/hub.c`, `src/class/hid/hid_host.c`, `src/portable/analog/max3421/hcd_max3421.c`, `src/common/tusb_fifo.c`等)を明示的にビルドする独自CMakeLists.txtのESP-IDFコンポーネントとしてラップする(Espressifパッケージとは別物として共存させ、既存Device roleには一切触れない)。`KVM_ROLE=HOST`のビルドにのみリンクする(Device roleは無関係)。
 3. **最小疎通確認**: まずは既存`usb_host_task.c`とは独立に、`rp2040_host_check.ino`と同じ発想の最小コード(`tuh_hid_mount_cb`でReport Descriptorをダンプ、`tuh_hid_report_received_cb`で生レポートをそのままログ出力するだけ)で、ESP32上でもMaxxterドングルから**7バイート届くか**を確認する(ESP32上でTinyUSB Host + MAX3421が動くこと自体の一次検証。SPIプローブによる自動検出はまだ後回しでよい)。
 4. **確認できたら本実装へ**: SPIプローブによるMAX3421検出→バックエンド選択のロジックを`usb_host_task.c`(またはその周辺)に実装し、`hid_report_parser.c`/`filter_rules.h`/`protocol.h`送信ロジックを両バックエンド共通で繋ぎ込む。9ボタンマウスquirkコードが本当に不要になったかもここで確認。
-5. **Hub経由の複数デバイス**確認(`mds/2026-08-22_multi_device.md`の要件)。MAX3421フォールバック時・native OTG時それぞれで。
+5. **Hub経由の複数デバイス**確認(`mds/usb_hid/2026-08-22_multi_device.md`の要件)。MAX3421フォールバック時・native OTG時それぞれで。
 
 ## Phase1 実装結果(ビルド確認済み、実機未検証)
 
@@ -128,7 +128,7 @@ ESP32S3-Plus標準SPIピン(MOSI=GPIO9 / MISO=GPIO8 / SCLK=GPIO7)+ CS=GPIO4 / RS
 Phase1の最後のステップ(`hid_report_parser.c`/`filter_rules.h`/`protocol.h`への接続)を実施。
 
 ### リファクタ: UDP送信+filter/mergeロジックを`hid_forwarder.c`に切り出し
-これまで`usb_host_task.c`(native OTGバックエンド)に直書きだった、UDPソケット管理・`filter_rules.h`適用・キーボードのマージ状態(物理キーボード+マウスボタンからの合成キーの合成、`mds/2026-08-21_filter_conv_route.md`)を、新設の`main/hid_forwarder.c`/`.h`に切り出した。両バックエンドが呼ぶ公開APIは3つだけ:
+これまで`usb_host_task.c`(native OTGバックエンド)に直書きだった、UDPソケット管理・`filter_rules.h`適用・キーボードのマージ状態(物理キーボード+マウスボタンからの合成キーの合成、`mds/usb_hid/2026-08-21_filter_conv_route.md`)を、新設の`main/hid_forwarder.c`/`.h`に切り出した。両バックエンドが呼ぶ公開APIは3つだけ:
 - `hid_forwarder_keyboard_report(modifiers, keycodes[6])`
 - `hid_forwarder_mouse_sample(buttons, dx, dy, wheel, pan)`
 - `hid_forwarder_consumer(usage_id)`
@@ -145,7 +145,7 @@ Phase1の最後のステップ(`hid_report_parser.c`/`filter_rules.h`/`protocol.
 実機テストで断続的に3バイートレポートが再発。何段階か仮説を試したが遠回りだった(結果的に無駄だった経緯として残す):
 1. 「TinyUSBのデフォルトプロトコル取り忘れ」仮説 → 実は取得済みで無関係
 2. 「`tuh_hid_set_protocol()`が非同期なのでreceive_report開始が早すぎる」仮説 → completion callback(`tuh_hid_set_protocol_complete_cb`)で同期化したが直らず
-3. **最終的にユーザーの指摘で気づいた根本原因**: dump-onlyの動作実績があるバージョン(コミット`a6a5301`)を基準に「そこから何が変わったか」で差分を見直すべきだった。差分は「`tuh_hid_mount_cb`内でマウス用に手動`tuh_hid_set_protocol(Report)`を追加で呼んでいたこと」——列挙時の自動SET_PROTOCOL(`tuh_hid_set_default_protocol()`+`CFG_TUH_HID_SET_PROTOCOL_ON_ENUM`、デフォルト有効)と合わせて**同じ内容のリクエストを2回**送っていたことになる。このドングルはSET_PROTOCOL周りが元々怪しい(`mds/2026-08-22_wireless_dongle_short_reports.md`)ので、重複リクエストで一時的にBoot形状のレポートを吐いていた可能性が高い。
+3. **最終的にユーザーの指摘で気づいた根本原因**: dump-onlyの動作実績があるバージョン(コミット`a6a5301`)を基準に「そこから何が変わったか」で差分を見直すべきだった。差分は「`tuh_hid_mount_cb`内でマウス用に手動`tuh_hid_set_protocol(Report)`を追加で呼んでいたこと」——列挙時の自動SET_PROTOCOL(`tuh_hid_set_default_protocol()`+`CFG_TUH_HID_SET_PROTOCOL_ON_ENUM`、デフォルト有効)と合わせて**同じ内容のリクエストを2回**送っていたことになる。このドングルはSET_PROTOCOL周りが元々怪しい(`mds/usb_hid/2026-08-22_wireless_dongle_short_reports.md`)ので、重複リクエストで一時的にBoot形状のレポートを吐いていた可能性が高い。
 
 対処: 手動の`tuh_hid_set_protocol()`呼び出しを完全に削除し、dump-onlyバージョンが実際にやっていた「自動の1回だけ」に戻した。dispatch/parsingロジックはそのまま追加。実機で7バイート確認できたので、これで確定とする。
 
@@ -164,7 +164,7 @@ Phase1の最後のステップ(`hid_report_parser.c`/`filter_rules.h`/`protocol.
 - type-c直結Device出力(将来対応、優先度は下げた)
 - ~~SPIプローブによるMAX3421自動検出→バックエンド選択~~ → Phase2で実装(下記)
 - 9ボタンマウス実機での再確認(quirk無しで本当に問題ないか) → 実機確認済み、問題なし
-- Hub経由の複数デバイス確認(`mds/2026-08-22_multi_device.md`の要件) → 実機確認済み、問題なし
+- Hub経由の複数デバイス確認(`mds/usb_hid/2026-08-22_multi_device.md`の要件) → 実機確認済み、問題なし
 
 ## Phase2 route/filterの詳細を詰める
 ### 要件

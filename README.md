@@ -23,7 +23,7 @@ USB HID機器(複数、HUB経由)をワイヤレス化したい。
   - `route_mouse_also_udp()`はtype-c接続中にUDPへもミラーするかどうかを、その生値(filter前)で判定する
   - 例: wheelをtype-cから消してUDPだけに残したい → `filter_rules.h`で`*wheel = 0`、`route_rules.h`の`route_mouse_also_udp()`で`wheel != 0 || pan != 0`のときtrueを返す(現在の実装済み設定)
   - keyboard/consumerは非対称化しておらず、従来通り「filter適用後の値をtype-c/UDP両方が見る」まま
-- 詳細: `mds/2026-08-21_filter_conv_route.md`, `mds/2026-08-23_filter_conv_router_with_max3421.md`
+- 詳細: `mds/usb_hid/2026-08-21_filter_conv_route.md`, `mds/usb_hid/2026-08-23_filter_conv_router_with_max3421.md`
 
 ## debug print類の場所
 

@@ -2,12 +2,12 @@
 
 ## 背景・動機
 
-MAX3421E経由のHost実装(`mds/2026-08-23_filter_conv_router_with_max3421.md`)は、実機で以下の問題を抱えたまま保留中だった:
+MAX3421E経由のHost実装(`mds/usb_hid/2026-08-23_filter_conv_router_with_max3421.md`)は、実機で以下の問題を抱えたまま保留中だった:
 - SPI通信自体が時々乱れる(mount/unmount不安定、0バイートレポート混入)
 - type-c直結Device出力を追加した際、`Unhandled interrupt 4 on cpu 0!`のクラッシュループが発生
 - 上記の切り分けのため電源を別供給しようとした結果、**MAX3421E自体が壊れた可能性が高い(初期化(REVISIONレジスタ確認)が通らなくなった)**
 
-一方、`rp2040_host_check/`(`mds/2026-08-22_rp2040_host_check.md`)では、**全く同じワイヤレスドングルをRP2040 + TinyUSB Hostスタックに挿すだけで、何の工夫もなく7バイート丸ごと正しく届く**ことを既に実機確認済み。ESP32-S3のネイティブUSBホスト固有の問題であって、ドングル側にもTinyUSBというソフトウェアスタック自体にも問題がないことは確定している。
+一方、`rp2040_host_check/`(`mds/usb_hid/2026-08-22_rp2040_host_check.md`)では、**全く同じワイヤレスドングルをRP2040 + TinyUSB Hostスタックに挿すだけで、何の工夫もなく7バイート丸ごと正しく届く**ことを既に実機確認済み。ESP32-S3のネイティブUSBホスト固有の問題であって、ドングル側にもTinyUSBというソフトウェアスタック自体にも問題がないことは確定している。
 
 MAX3421Eが物理的に故障した(かもしれない)今、**MAX3421Eチップの代わりにRP2040自体をUSB Hostコントローラとして使い、ESP32とはUART等の単純なリンクで繋ぐ**方針を検討する。
 
@@ -55,7 +55,7 @@ UART(単純な調歩同期、バイト単位で自己クロック)はSPI(複数�
 - **TinyUSB Hostスタック(`tuh_*` API)・SPI・MAX3421関連コードは一切不要** - `components/tinyusb`のHost側ビルド(`hcd_max3421.c`等)ごと外せる可能性がある(ただしtype-c Device出力(Phase2)がrhport0を使う設計はそのまま維持できる - むしろrhport1(Host)を丸ごと使わなくなる分、tusb_config.hがシンプルになる)
 
 ### 電源・配線
-- RP2040側のVBUS問題(基板のVBUSピンがデバイス専用でダイオードブロックされている)は`mds/2026-08-22_rp2040_host_check.md`で既にジャンパー直結で解決済み、そのまま流用可能。
+- RP2040側のVBUS問題(基板のVBUSピンがデバイス専用でダイオードブロックされている)は`mds/usb_hid/2026-08-22_rp2040_host_check.md`で既にジャンパー直結で解決済み、そのまま流用可能。
 - ESP32-RP2040間はUART(TX/RX/GND)のみで、MAX3421のような高精度クロック配線は不要。
 
 ## 移行方針
@@ -70,8 +70,8 @@ UART(単純な調歩同期、バイト単位で自己クロック)はSPI(複数�
 - ビルド/書き込みは既存の`bin/build_flash_rp2040.sh rp2040_host_check tinyusb_host build/flash`がそのまま使える見込み
 
 ## 参考
-- `mds/2026-08-22_rp2040_host_check.md`: RP2040でこのドングルが7バイート届くことを実証済みの記録(VBUSジャンパーの詳細等も含む)
-- `mds/2026-08-23_filter_conv_router_with_max3421.md`: MAX3421方式の実装記録・既知の不安定さ・type-c Device出力(Phase2)の実装内容
+- `mds/usb_hid/2026-08-22_rp2040_host_check.md`: RP2040でこのドングルが7バイート届くことを実証済みの記録(VBUSジャンパーの詳細等も含む)
+- `mds/usb_hid/2026-08-23_filter_conv_router_with_max3421.md`: MAX3421方式の実装記録・既知の不安定さ・type-c Device出力(Phase2)の実装内容
 - `rp2040_host_check/rp2040_host_check.ino`: 拡張のベースになる既存スケッチ
 
 ## 実装結果(ビルド確認済み、実機未検証)

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Build esp32-kvm-ip in Device role (default/original behavior: USB HID
 # device connected to the Target PC). Uses the project's default build/
-# directory. See mds/2026-08-21_usb_host.md for why role is a plain CMake
+# directory. See mds/usb_hid/2026-08-21_usb_host.md for why role is a plain CMake
 # variable instead of a Kconfig choice, and bin/build_host.sh for the
 # other role.
 #

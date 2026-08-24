@@ -1,6 +1,6 @@
 # RP2040 host check
 
-See `mds/2026-08-22_rp2040_host_check.md` for what this is and why.
+See `mds/usb_hid/2026-08-22_rp2040_host_check.md` for what this is and why.
 
 ## Build / flash
 
