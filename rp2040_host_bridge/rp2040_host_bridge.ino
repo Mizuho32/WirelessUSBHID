@@ -80,7 +80,7 @@ Adafruit_USBH_Host USBHost;
 // chasing the type-c crash (mds/2026-08-23_rp2040_host_status.md) - an
 // integer increment plus one printf/sec should not have that problem,
 // but keep an eye out.
-#define RATE_MONITOR 1
+#define RATE_MONITOR 0
 
 // Toggle for a one-shot, interactive "how fast can this mouse/dongle
 // actually poll" measurement, run once in setup() before the bridge
