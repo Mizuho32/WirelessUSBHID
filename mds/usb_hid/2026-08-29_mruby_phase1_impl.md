@@ -26,8 +26,48 @@
 - **git submodule**: `esp32-kvm-ip/components/mruby/mruby`は`Wireless_USBHID`(親)→`esp32-kvm-ip`(submodule)→`mruby`(その中のsubmodule)という2階層目のsubmoduleになった。フレッシュチェックアウトでは`git submodule update --init --recursive`が要る(`--recursive`を付け忘れると空ディレクトリのままビルドが`mruby.h: No such file`等で失敗する)。
 - **Ruby + rake**: mruby自身のビルドシステムが必要。ESP-IDFのxtensaツールチェインとは別に、ビルドを実行するホスト機にRuby(rake同梱)が要る。`components/mruby/CMakeLists.txt`の`find_program(RAKE_EXECUTABLE rake)`が見つからない場合は`FATAL_ERROR`で明示的に落ちるので、専用のセットアップスクリプトは用意していない(READMEに一言添えれば十分と判断)。
 
-## 未着手(Phase1の先)
+## DSL実装(source/sink/pipeline)
 
-- DSL(source/sink/pipeline)本体の実装 - 現状の`main/mruby_scripts/default.rb`は素通しのみ
+Phase1の配管確認が取れたので、[[2026-08-28_mruby_filter_route]]の3節で設計したDSLを実装した。旧来の`filter_keyboard`/`filter_mouse`/`route_*_udp`という6関数API(`main/mruby_scripts/default.rb`・`examples/wheel_to_udp_only.rb`が使っていたもの)は完全に置き換え、両スクリプトともDSL版に書き直し済み。
+
+### 実装した構成
+
+- `source(name, :usb_host, kind: :keyboard/:mouse/:consumer)` / `sink(name, :typec/:udp, ...)` / `pipeline(name) { from(...); to(...) { |ev| ... }; branch(sink) { |ev| ... } }` を`mrb_define_method`でKernelメソッドとして登録
+- これらは**スクリプトロード時に一度だけ評価**され、固定長Cの配列(`sink_def_t[8]`、kind別`pipeline_t`×3、各`to`/`branch`最大6段)に解決される。イベントの度にDSLをたどる実装ではない(設計docの「実行時の性能設計」を満たす)
+- `to`/`branch`が保持するブロック(Proc)は`mrb_gc_register()`でGCから保護し、VM生存中ずっと使えるようにしている
+- ディスパッチ関数(`mruby_dispatch_keyboard/mouse/consumer`)が`hid_forwarder.c`から直接呼ばれ、typec/UDP問わずそのkindの全sinkへの送信を一手に引き受ける(旧来の「filter一発→routeの可否だけ別判定」という2段構えは無くなった)
+
+### 設計docの原案から意図的に簡略化した点
+
+1. **イベント表現はHash、dot記法オブジェクトではない**: `ev.wheel = 0`ではなく`ev[:wheel] = 0`。専用クラス+アクセサをkind毎に自作するコストに見合わないと判断し、mrubyの既存Hash APIをそのまま使った
+2. **マウス発火の合成キーボードキー(back/forward→Alt+矢印)は`to`ブロックの出力ではなく、独立したトップレベルフック`mouse_synth_keys(buttons, dx, dy, wheel, pan) -> [modifiers, keycode]`**にした。sink/pipelineは「どこに送るか」に専念させ、「キーボード側の合成状態に何を足すか」は別の関心事として分離
+3. **`source`に`:udp`(Device role相当をこのエンジンに統合)は未実装**。`:usb_host`のみ。Host/Device役割の統合は設計docに書いた将来像ではあるが、今回の実装対象からは明示的に除外(スコープ拡大を避けた)
+4. **`to`はブロックを共有する複数sink指定**が可能(`to :typec_kbd, :main_pc do |ev| ... end`のように1つの変換結果を複数sinkへ流す)。sink毎に個別クローンして別々に変換、という形にはしていない(設計doc擬似コードの用法とも一致)
+5. **`to`にブロックが無ければ無変換の素通しファンアウト**(`to :typec_kbd`だけ)。`branch`は常にブロック必須で、常に生値(他のtoステージの変換の影響を受けない)を見る
+
+### 実装上の注意点(次に触る時のため)
+
+- **ブロック呼び出しは`mrb_yield_argv()`ではなく`mrb_funcall_argv(block, :call, ...)`を使っている**。`mruby_dispatch_*()`はmrubyの呼び出しチェーンの外(素のFreeRTOSタスクコンテキスト)から呼ばれるため、既存の保護フレーム(jmp_buf)が無い。`mrb_funcall_argv()`はそれ自体が保護済みのトップレベル呼び出しであることがPhase1で実証済み(スクリプト内エラーがクラッシュせず`mrb->exc`に載るだけで済んでいた)なのに対し、`mrb_yield_argv()`が同じ保証を持つかは未確認だったため、安全側に倒して`#call`経由で統一した
+- 各ディスパッチ関数の中でHashを組み立てる際も、Phase1で踏んだGCアリーナリーク(前述5番)と同じ罠があるため、引き続き`mrb_gc_arena_save`/`restore`を関数全体に掛けている
+- スクリプトロードのリトライ(アップロード済みスクリプト失敗→埋め込みdefault.rbへフォールバック)の間で、sink/source/pipelineの登録状態が残ったままだと2回目のロードが壊れるため、各ロード試行の直前に`reset_dsl_state()`で全部クリアしている
+
+### ビルド確認
+
+Host role: `esp32-kvm-ip.bin`は3MBパーティション中33%空き(mruby込み)。Device role(mrubyなし)は73%空き。両ロールともビルド成功。
+
+### 実機で発覚: `sink :udp`のgetaddrinfo()が早すぎてlwIPクラッシュ
+
+`wheel_to_udp_only.rb`(`sink :main_pc, :udp, host:, port:`を含む)をアップロードして実機で試したところ、`NVS initialized`の直後に`assert failed: tcpip_send_msg_wait_sem ... Invalid mbox`でクラッシュした。
+
+原因: `dsl_sink()`が`:udp`のhost/portを即座に`getaddrinfo()`で解決していたが、`mruby_filter_init()`(hostname機能のため`wifi_manager_init()`より前に呼ぶよう変更済み、[[2026-08-28_mruby_filter_route]]参照)の中でスクリプトをロードする時点ではまだ`esp_netif_init()`(lwIPのTCP/IPスレッド起動)が実行されておらず、`getaddrinfo()`がmboxの無いスレッドにメッセージを送ろうとして落ちていた。
+
+対処: `sink_def_t`にhost文字列/portをそのまま保持するだけにして、実際の`getaddrinfo()`は新設の`mruby_filter_resolve_udp_sinks()`に分離、`main_host.c`で`wifi_manager_init()`成功後(`hid_forwarder_init()`の直前)に呼ぶよう変更。未解決の間(`udp_resolved == false`)は該当sinkへの送信は黙ってスキップする(`send_*_to_sink()`のガード)。`hid_forwarder.c`の`resolve_target()`も元々同じ理由でWiFi初期化後に置かれており、今回はそのパターンに揃えた形。
+
+## 未着手
+
 - Phase2: LittleFS/SPIFFSスクリプトパーティション + WebUI編集
-- 実機での`mrb_funcall()`往復コスト計測、hostname設定の反映確認、フォールバック動作確認(ユーザー側で実施予定)
+- `:udp`をsourceとして実装し、Host/Device roleをこのエンジンに統合する(設計docの将来像、今回は対象外)
+- 実機での動作確認一式(ユーザー側で実施予定):
+  - DSL版スクリプト(`default.rb`・`wheel_to_udp_only.rb`)が実際に動くか(特に`wheel_to_udp_only.rb`でwheelがtype-cから消えてUDPにだけ出るか)
+  - `to`/`branch`ブロックの`mrb_funcall_argv(..., :call, ...)`往復コスト(旧6関数APIより1段呼び出しが増えている分、実測が必要)
+  - GCアリーナ管理が新しいHash組み立てパターンでも機能しているか(マウスを動かし続けてOOM/checksum mismatchが再発しないか)
