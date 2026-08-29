@@ -63,11 +63,62 @@ Host role: `esp32-kvm-ip.bin`は3MBパーティション中33%空き(mruby込み
 
 対処: `sink_def_t`にhost文字列/portをそのまま保持するだけにして、実際の`getaddrinfo()`は新設の`mruby_filter_resolve_udp_sinks()`に分離、`main_host.c`で`wifi_manager_init()`成功後(`hid_forwarder_init()`の直前)に呼ぶよう変更。未解決の間(`udp_resolved == false`)は該当sinkへの送信は黙ってスキップする(`send_*_to_sink()`のガード)。`hid_forwarder.c`の`resolve_target()`も元々同じ理由でWiFi初期化後に置かれており、今回はそのパターンに揃えた形。
 
+## `:udp` source実装(Host/Device統合の第一歩)
+
+`:udp`をsourceとして実装した。design docで「今回は対象外」としていたピースだが、実際にやってみると既存のkindごと固定パイプライン配列(`s_pipelines[PIPE_KEYBOARD/MOUSE/CONSUMER]`)をそのまま活かせる形に収まった。
+
+### 設計上のポイント
+
+- `:usb_host`ソースは元々kindが`source()`宣言時に固定(物理マウスは常にマウスイベントしか出さない)。一方`:udp`ソースは**1つのlisten portに種類の異なるパケットが混在して届く**(`protocol.h`の`EVENT_TYPE_*`で判別)ため、kindをsource宣言時ではなく`from`呼び出し時に指定させることにした: `from :net_in, kind: :mouse`。design docの擬似コード(1つの`pipeline :from_network`が3種類を`to`で自動振り分け)とは違う形で、**kind毎に別々の`pipeline`ブロックを書く**(`pipeline :net_keyboard do from :net_in, kind: :keyboard; ... end`のように)必要がある — 実装の単純さを優先した簡略化
+- ローカル入力用の`s_pipelines[]`とは完全に別の`s_net_pipelines[]`を新設(kindごとに3つ、ローカル用と対で計6つ)。`mruby_dispatch_keyboard/mouse/consumer()`(ローカル、`hid_forwarder.c`から)と`mruby_dispatch_net_keyboard/mouse/consumer()`(ネットワーク、後述の受信タスクから)は共通の`dispatch_*_via(pipeline_t*, ...)`ヘルパーに実体を持たせ、どちらの配列を渡すかだけが違う
+- `mouse_synth_keys`フックは**ローカル入力側だけで呼ぶ**(ネットワーク受信したマウスサンプルは送信元ボード側で既に処理済みのはずなので、受信側で再度back/forward判定をするのは二重適用になり不適切と判断)
+- 受信タスク(`net_source_task`, 4096byteスタック)は`sink :udp`と同じ理由でWiFi初期化後に`mruby_filter_start_net_source()`から起動(スクリプトが`:udp` sourceを宣言していなければ何もしない)。1ボードにつきlisten portは1つまで(`source`で2個目の`:udp`宣言はエラー)
+
+### サンプル
+
+`main/mruby_scripts/examples/device_role_bridge.rb`を新規作成: ローカルUSB入力(従来通りtype-cへ)に加え、UDPポート9000で受けたHIDイベントもtype-cへ再送する、Host/Device両方を1枚でこなす構成のデモ。
+
+### USB Hostバックエンド選択の完全なmruby化
+
+`device_role_bridge.rb`(RP2040 bridge未接続、UDP受信→type-c転送が主目的の使い方)で気づいた問題: `main_host.c`のバックエンド選択は元々「RP2040/MAX3421E不在ならnative OTGをHost入力として使う」という完全ハードコードのフォールバックで、この場合`typec_capable`が`false`のままになり**`usb_device_typec_start()`が一切呼ばれない**。RP2040/MAX3421EはUART/SPI経由でネイティブUSB-Cポートを消費しないから両立できるが、native OTGフォールバックは同じポートをHost入力に使ってしまうため、type-c出力と物理的に両立できない。
+
+最初は「スクリプトが`:udp` sourceを宣言していれば」という暗黙のヒューリスティックで対処したが、「UDP/RP2040/MAX3421/OTG Hostを完全にmruby向けに抽象化、接続はmrubyでコントロールできるように」という要望を受けて作り直した。
+
+- 新DSL: `usb_host_backends(*syms)` — `:rp2040_bridge`/`:max3421`/`:native_otg`を試行順に列挙。列挙しなかったbackendは無効化される(`:native_otg`を外せばtype-c出力専用に空く)
+- スクリプトが`usb_host_backends`を一度も呼ばなかった場合のみ、`mruby_filter_init()`内(スクリプト全体のロードが終わった後)でデフォルトへ解決する:
+  - `:udp` source宣言が**ある**場合 → `[:rp2040_bridge, :max3421]`(`:native_otg`を含めない)
+  - **無い**場合 → 従来通り`[:rp2040_bridge, :max3421, :native_otg]`
+  - **理由**: `:udp` sourceを宣言するスクリプトは「ネットワークから受けた入力をtype-cに出したい」という意図が明確なので、RP2040/MAX3421Eが物理的に無い環境でもnative OTGはtype-c出力専用に空けておきたい(Host入力に取られると`:udp`経由の入力が出力先を失う)。一方`:udp` sourceを宣言しない普通のスクリプト(`default.rb`等)は、`usb_host_backends`という機能自体を知らなくても今まで通りの挙動(RP2040/MAX3421E不在ならnative OTGをHost入力として使う)を維持したいので、そちらはデフォルトを変えない。**要するに「察して切り替える」ヒューリスティックであり、明示的な`usb_host_backends`呼び出しの方が優先される**(ユーザーからは「趣旨とズレてる気がするが実害は無いので残す」という判断をもらった、2026-08-29)
+- `main_host.c`は`mruby_filter_host_backend_count()`が0(=mruby非active、VM起動失敗かスクリプト2段階とも読み込み失敗)なら**元のハードコードなprobe順序に完全フォールバック**、そうでなければリストを順に試して最初に起動できたところで止める、というループに書き換え。これが「mruby初期化失敗でpure Cにfallback」の実体
+- `device_role_bridge.rb`には`usb_host_backends :rp2040_bridge, :max3421`を明示で追加(デフォルト解決でも同じ結果になるが、この例の要点なので明示した)
+
+### 実機で発覚: `net_source_task`とローカル入力タスクの競合(mrb_stateはスレッドセーフでない)
+
+`device_role_bridge.rb`(ローカルusb_host由来のpipelineと`:udp` source両方を持つ)をRP2040 bridge接続状態で試したところ、`checksum mismatch (msg_type=0x04), resyncing`が大量発生。原因は、`net_source_task`(ネットワーク受信、新設)と`dispatch_task`(RP2040 bridge、ローカル入力)が**同じ`mrb_state`(`s_mrb`)へ別々のFreeRTOSタスクから同時にアクセスしうる**状態になっていたこと。mrubyのVM状態はスレッドセーフではないため、両方が同時にHIDイベントを処理しようとすると内部(GC/ヒープ/アリーナ)が壊れ、以前のGCアリーナリークと同じ経路でヒープ破損→UART側のchecksumまで巻き込まれる形で症状が出た。
+
+対処: `s_mrb_mutex`(`xSemaphoreCreateMutex()`)を追加し、`mruby_dispatch_keyboard/mouse/consumer()`と`mruby_dispatch_net_keyboard/mouse/consumer()`の6関数全てで、本体を`xSemaphoreTake`/`xSemaphoreGive`で挟むようにした。ローカル入力とネットワーク入力の両方を使うスクリプト(`device_role_bridge.rb`等)を書く場合、この手当てが無いと確実に踏む問題だったので、DSL側に両方の口(source/pipeline)を用意する以上、C側で排他制御するのは必須の対応だった。
+
+### 実機で発覚: `from`の引数仕様(aspec)の更新漏れ
+
+`device_role_bridge.rb`をアップロードすると`from: wrong number of arguments (given 2, expected 1) (ArgumentError)`で読み込み失敗、Cフォールバック(埋め込み`default.rb`)に落ちていた。
+
+原因: `dsl_from()`を`:udp` source対応(`from :net_in, kind: :mouse`のオプションHash引数を受けられるよう`mrb_get_args(mrb, "n|H", ...)`に変更)した際、`mrb_define_method()`に渡す引数仕様(aspec)を`MRB_ARGS_REQ(1)`のまま更新し忘れていた。mrubyは呼び出し時にaspecでまず引数個数をチェックするため、C関数の中身(`mrb_get_args`)が対応していても、aspec側が「引数1個ちょうど」を要求している限り2引数呼び出しはC関数に入る前に弾かれる。`MRB_ARGS_ARG(1, 1)`(必須1+任意1)に修正。
+
+他のDSLメソッド(source/sink/pipeline/to/branch/usb_host_backends)のaspecと`mrb_get_args`の対応も一通り確認し、ズレていたのは`from`だけだった。**教訓**: `mrb_get_args`のフォーマット文字列を変更したら、対応する`mrb_define_method`のaspecも必ず同時に見直すこと。
+
+### checksum mismatch再発の件、再現性なし(電源供給を疑う)
+
+`from`のaspec修正後、`device_role_bridge.rb`アップロード→ローカルマウス操作のみで`frame len ... exceeds max 512`/`checksum mismatch (msg_type=0x55)`が再発。切り分けのため`default.rb`(`:udp` source無し、`net_source_task`が一切起動しない)に切り替えて同条件で試したところ発生せず。ところが`device_role_bridge.rb`に戻して再試行したら**今度は正常**——つまり`:udp` source/`net_source_task`の有無で再現性が変わったわけではなく、単発の不安定事象だった可能性が高い。MCUへの電力供給が絡んでいる可能性がユーザーから指摘されている(RP2040 bridge関連の別調査でも電源起因の不安定挙動が過去に疑われている)。今回のmruby側の変更(mutex追加、`:udp` source実装)が原因と断定できる材料は無し。実機側の電源まわりの問題である可能性を念頭に置きつつ、再発時は改めて条件(電源、USBケーブル/ハブ構成など)を記録した方が良さそう。
+
+### ビルド確認
+
+Host role: 33%空き。実機テストは未実施(受信側の動作確認、ローカル/ネットワーク両経路が輻輳した際の挙動などは要検証)。
+
 ## 未着手
 
 - Phase2: LittleFS/SPIFFSスクリプトパーティション + WebUI編集
-- `:udp`をsourceとして実装し、Host/Device roleをこのエンジンに統合する(設計docの将来像、今回は対象外)
 - 実機での動作確認一式(ユーザー側で実施予定):
   - DSL版スクリプト(`default.rb`・`wheel_to_udp_only.rb`)が実際に動くか(特に`wheel_to_udp_only.rb`でwheelがtype-cから消えてUDPにだけ出るか)
   - `to`/`branch`ブロックの`mrb_funcall_argv(..., :call, ...)`往復コスト(旧6関数APIより1段呼び出しが増えている分、実測が必要)
   - GCアリーナ管理が新しいHash組み立てパターンでも機能しているか(マウスを動かし続けてOOM/checksum mismatchが再発しないか)
+  - `:udp` source(`device_role_bridge.rb`)の受信動作、`net_source_task`のGC/アリーナ挙動
