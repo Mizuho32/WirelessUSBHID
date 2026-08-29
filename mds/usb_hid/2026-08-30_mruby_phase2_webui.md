@@ -97,6 +97,16 @@ ESP-IDFのヒープアロケータには`heap_caps_malloc(size, caps)`という�
 
 **未検証**: 実機でのPSRAM検出(起動ログにPSRAM関連の初期化メッセージが出るか)、`heap_caps_malloc(..., MALLOC_CAP_SPIRAM)`が実際にPSRAM由来のポインタを返しているか、モード(Octal)の想定が実機のチップと一致しているか、マウス高頻度経路のFPSに変化が無いか — いずれもユーザー側での実機確認待ち。
 
+### 実機で再発: task "main"のスタックオーバーフロー(2回目)
+
+PSRAM有効化を実機で試したところ、`I (1520) MRBFILT: mruby VM active (hostname not set by script)`の直後にまた"main"タスクのスタックオーバーフローが発生した。[[2026-08-29_mruby_phase1_impl]]で一度踏んだのと同じ症状(そのときは`mruby_filter_init()`自体のVM初期化+Prismパーサーが原因で3584→8192に増やした)。
+
+今回は`mruby_filter_init()`(ログの通り正常終了済み)より後、`main_host.c`の`app_main()`が同じ"main"タスク上でその後呼ぶ処理のどれかが原因のはず。この並びに新しく増えたのは`mruby_webui_start()`(Phase2、`esp_http_server`の`httpd_start()`を呼ぶ)だけなので、これが最有力候補と見ている。
+
+**正確な発生箇所は特定できていない**: パニック時のbacktrace(`0x40381cbd`等)を`addr2line`で解決しても、`panic_abort`/`vApplicationStackOverflowHook`/`vTaskSwitchContext`等、スタックオーバーフロー検出機構自身のフレームしか出てこない(検出はコンテキストスイッチ時のカナリアチェックで行われるため、壊れた側のタスク自身の呼び出しフレームは辿れない)。`uxTaskGetStackHighWaterMark()`等で実測しての追い込みはしていない。
+
+**対処**: `CONFIG_ESP_MAIN_TASK_STACK_SIZE`を8192→16384に倍増(`sdkconfig.defaults`)。このタスクは`app_main()`が返れば(=起動完了後)スタック自体が解放される一過性のものなので、多少大きく取っても定常状態のヒープ予算は圧迫しない — 正確な原因箇所を詰め切るより、実害の少ない側に倒した。実機での再検証待ち。
+
 ## 未着手(Phase3、design docの「余力があれば」項目)
 
 - 保存前のシンタックスチェック(mrubyパーサーだけ先に走らせて構文エラーを弾く)
