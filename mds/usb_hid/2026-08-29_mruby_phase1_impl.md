@@ -116,7 +116,7 @@ Host role: 33%空き。実機テストは未実施(受信側の動作確認、�
 
 ## 未着手
 
-- Phase2: LittleFS/SPIFFSスクリプトパーティション + WebUI編集
+- Phase2(WebUI編集)は実装した。[[2026-08-30_mruby_phase2_webui]]参照
 - 実機での動作確認一式(ユーザー側で実施予定):
   - DSL版スクリプト(`default.rb`・`wheel_to_udp_only.rb`)が実際に動くか(特に`wheel_to_udp_only.rb`でwheelがtype-cから消えてUDPにだけ出るか)
   - `to`/`branch`ブロックの`mrb_funcall_argv(..., :call, ...)`往復コスト(旧6関数APIより1段呼び出しが増えている分、実測が必要)
