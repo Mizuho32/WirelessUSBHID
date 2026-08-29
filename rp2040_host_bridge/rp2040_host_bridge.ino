@@ -139,7 +139,24 @@ static uint32_t last_heartbeat_ms;
 // here and periodically re-send their MOUNT frame; usb_host_rp2040_bridge.c's
 // registration is idempotent so re-announcing an already-known device
 // is harmless.
-#define MAX_TRACKED_DEVICES    4
+// 8 (was 4): a hub with a 5-button mouse (1 HID interface) + keyboard
+// (3 HID interfaces - Boot Keyboard, a Vendor Page 0xFF60 interface, and
+// a Report-ID-multiplexed complex interface, see
+// mds/usb_hid/2026-08-22_consumer_control.md) + a 9-button mouse (up to
+// ~4 interfaces per mds/usb_hid/2026-08-22_9buttons_mouse.md's
+// investigation - main mouse, a macro keyboard IF, likely a Consumer
+// Control IF, possibly a vendor IF) adds up to more than 4 mountable HID
+// interfaces. With the table full, tuh_hid_mount_cb() below silently
+// dropped whichever interface(s) mounted last (order/timing-dependent
+// at cold power-on) from ever being tracked - meaning if the ESP32
+// boots/reboots *after* the RP2040 already enumerated everything, those
+// dropped interfaces are never re-announced (the periodic reannounce
+// loop below is the *only* way an already-running RP2040 tells a
+// freshly-booted ESP32 about devices it missed the original one-shot
+// MOUNT frame for) and stay invisible on that side until the RP2040
+// itself is reset. Bumped well past today's actual interface count for
+// headroom.
+#define MAX_TRACKED_DEVICES    8
 #define MAX_TRACKED_DESC_LEN   512
 #define REANNOUNCE_INTERVAL_MS 2000
 
@@ -359,6 +376,14 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t idx, const uint8_t *report_desc,
     tracked->itf_protocol = itf_protocol;
     tracked->desc_len = desc_len < MAX_TRACKED_DESC_LEN ? desc_len : MAX_TRACKED_DESC_LEN;
     memcpy(tracked->desc, report_desc, tracked->desc_len);
+  } else {
+    // Table full (MAX_TRACKED_DEVICES) - this interface's initial MOUNT
+    // frame above still went out, so it works fine as long as the ESP32
+    // was already listening at that exact moment, but it will never be
+    // re-announced (see the tracked_devices comment) if the ESP32 boots
+    // later. Was silent before - this was hard to diagnose.
+    DEBUG_PRINTF("WARNING: tracked_devices full (%d) - dev_addr=%u idx=%u will not be re-announced\r\n",
+                 MAX_TRACKED_DEVICES, dev_addr, idx);
   }
 
   if (!tuh_hid_receive_report(dev_addr, idx)) {
