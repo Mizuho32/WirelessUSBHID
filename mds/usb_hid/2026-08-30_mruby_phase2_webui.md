@@ -81,7 +81,21 @@ Host role: 3MBパーティション中32%空き(Phase1時点の33%からWebUI追
 - 新設`mruby_filter_script_len()`: 実際のスクリプト長を(中身を読まず)返す。`mruby_webui.c`の`script_get_handler()`はこれで実サイズ分だけmallocするようになり、常に64KB決め打ちで確保していたのをやめた(典型的なDSLスクリプトなら数KBで済む)
 - `mruby_webui.c`: `status_get_handler()`の「`webui_html`パーティションに中身があるか」チェックも、フルバッファをmalloc→即freeする実装(`read_webui_html_partition()`)から、ヘッダだけ読む`find_webui_html_partition()`に変更(最大32KB分の無駄なmalloc/freeを排除)
 
-**未対応・保留**: PSRAMを`CONFIG_SPIRAM=y`で有効化すれば、これらのmalloc全般(将来的にはmrubyのVMヒープ自体も)が8MBの外部メモリへ逃がせるようになり、この種のヒープ逼迫はより根本的に解消される可能性が高い。ただし[[2026-08-28_mruby_filter_route]]の「一番のリスク」節で懸念していた通り、PSRAMアクセスは内蔵SRAMより低速(キャッシュに乗らない範囲は特に)なため、マウスの高頻度dispatch経路への影響を実機で確認しないまま有効化するのは避けた。今回はWebUI側の無駄な確保を削るだけに留め、PSRAM有効化は別途判断が要る変更として保留している。
+**この後PSRAMを有効化した(次節参照)。**
+
+### PSRAM有効化(WebUIのバッファだけをターゲットに)
+
+上記の"out of memory"対応の続きとして、「WebUIのバッファだけPSRAMに逃がせないか、`malloc()`はRTOSが自動割り当てするので無理では?」という質問への回答を実装した。
+
+ESP-IDFのヒープアロケータには`heap_caps_malloc(size, caps)`という、確保先を明示的に選べるAPIがある。`SPIRAM_USE`という設定(`menu "SPI RAM config"`)には3つの選択肢があり、そのうち`SPIRAM_USE_CAPS_ALLOC`(**"Add RAM to heap_caps allocator (malloc() stays internal by default)"**、まさにこの用途向けの選択肢)を選べば、プレーンな`malloc()`(mrubyのVMヒープが内部で使っているもの)は今まで通り内蔵SRAM限定のまま、`heap_caps_malloc(size, MALLOC_CAP_SPIRAM)`を明示的に呼んだ箇所だけがPSRAMを使う、という狙い通りの「全か無かではない」制御ができる(デフォルトの`SPIRAM_USE_MALLOC`だとサイズ閾値ベースで`malloc()`自体が透過的にPSRAMへ溢れる設定になり、mrubyのホットパスへの影響が読みにくくなるため、意図的にデフォルトではなくこちらを選んだ)。
+
+- `sdkconfig.defaults`: `CONFIG_SPIRAM=y`、`CONFIG_SPIRAM_MODE_OCT=y`(XIAO ESP32S3のESP32-S3R8はOctal SPI PSRAM内蔵)、`CONFIG_SPIRAM_USE_CAPS_ALLOC=y`、`CONFIG_SPIRAM_IGNORE_NOTFOUND=y`(想定と違って物理的にPSRAMが無い/モードが違う場合でも起動は継続させ、単にPSRAM側の確保が常に失敗する状態に留める安全弁)
+- `mruby_webui.c`: `webui_alloc(size)`ヘルパーを新設。`heap_caps_malloc(size, MALLOC_CAP_SPIRAM)`を試し、失敗(PSRAM未搭載/未検出/枯渇のいずれか)なら通常の`malloc()`にフォールバック — PSRAMが効かなかった場合でも今まで通りの動作に留まる。`script_get_handler()`・`recv_full_body()`(`script_post_handler()`/`frontend_post_handler()`共用)・`read_webui_html_partition()`の3箇所、この一時的なリクエストバッファ全てをこれ経由に変更
+- mrubyのVMヒープ・GCアリーナ・ディスパッチ経路(`mruby_dispatch_*`)は一切変更していない — 引き続き素の`malloc()`(内蔵SRAM限定)を使うので、[[2026-08-28_mruby_filter_route]]の「一番のリスク」節で懸念していたマウス高頻度経路への影響は原理上ゼロのはず(実機のFPS計測での確認はまだ)
+
+**sdkconfigの手当てで踏んだ落とし穴**: `sdkconfig.defaults`に`CONFIG_SPIRAM=y`等を書き足しただけでは既存の`sdkconfig`(gitignore、ローカル生成物)に反映されなかった — ESP-IDFのビルド設定は、`sdkconfig`に既に明示的に記録済みの値(`# CONFIG_SPIRAM is not set`という行もれっきとした「既に記録済み」扱い)を`sdkconfig.defaults`が上書きすることはなく、新規オプションの初期値埋めにしか使われないため。素朴に`sdkconfig`を消して丸ごと再生成する手も試したが、これは無関係な`CONFIG_LIBC_NEWLIB`が(このESP-IDFバージョンでの新規デフォルト解決により)`CONFIG_LIBC_PICOLIBC`側に倒れてしまい、mruby(別のRubyベースのビルドシステムで事前にビルド済みの`libmruby.a`、newlibの`__getreent`/`_ctype_`に依存)がリンクできなくなる副作用を引き起こした(ロールバック済み)。最終的には、変更したいシンボルだけ(`CONFIG_SPIRAM`/`_MODE_OCT`/`_USE_CAPS_ALLOC`/`_IGNORE_NOTFOUND`の4行)を`sdkconfig`に直接追記し、`idf.py reconfigure`に依存関係グラフの残り(`SPIRAM_TYPE_AUTO`、`SPIRAM_CLK_IO=30`、`SPIRAM_BOOT_INIT=y`等)を正しく解決・補完させる、という最小差分の手当てに落ち着いた。
+
+**未検証**: 実機でのPSRAM検出(起動ログにPSRAM関連の初期化メッセージが出るか)、`heap_caps_malloc(..., MALLOC_CAP_SPIRAM)`が実際にPSRAM由来のポインタを返しているか、モード(Octal)の想定が実機のチップと一致しているか、マウス高頻度経路のFPSに変化が無いか — いずれもユーザー側での実機確認待ち。
 
 ## 未着手(Phase3、design docの「余力があれば」項目)
 
