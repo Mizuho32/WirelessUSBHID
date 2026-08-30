@@ -1,0 +1,6 @@
+source "https://rubygems.org"
+
+ruby ">= 3.0"
+
+gem "em-websocket", "~> 0.5"
+gem "base64" # em-websocketの依存先(handshake04.rb)が使用。Ruby 3.4でデフォルトgem外になったため明示
