@@ -172,6 +172,24 @@ typedef struct {
 static tracked_device_t tracked_devices[MAX_TRACKED_DEVICES];
 static uint32_t last_reannounce_ms;
 
+// LED_BUILTIN as a simple "HID device present" indicator: on once any HID
+// interface has mounted, off again once the last one unmounts. Counts
+// mounted *interfaces* independently of tracked_devices[] (which can fill
+// up - see the MAX_TRACKED_DEVICES comment above - and shouldn't gate this
+// LED), so a keyboard alone mounting 3 interfaces just means 3 increments/
+// decrements that net out correctly.
+//
+// The "off" side doubles as a placeholder for the not-yet-implemented
+// dormant-sleep trigger from mds/usb_hid/2026-08-31_rp2040_sleep_plan.md
+// (currently on hold): once ESP32->RP2040 sleep commands exist, that
+// handler should turn this LED off too, same as reaching zero mounted
+// interfaces does today.
+static uint16_t s_hid_mount_count;
+
+static void update_hid_led(void) {
+  digitalWrite(LED_BUILTIN, s_hid_mount_count > 0 ? HIGH : LOW);
+}
+
 static tracked_device_t *find_tracked_device(uint8_t dev_addr, uint8_t idx) {
   for (int i = 0; i < MAX_TRACKED_DEVICES; i++) {
     if (tracked_devices[i].in_use && tracked_devices[i].dev_addr == dev_addr && tracked_devices[i].idx == idx) {
@@ -271,6 +289,9 @@ static void run_poll_ceiling_test(void) {
 #endif
 
 void setup() {
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, LOW);
+
   Serial1.begin(BRIDGE_BAUD);
   DEBUG_BEGIN();
   delay(500);
@@ -389,6 +410,9 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t idx, const uint8_t *report_desc,
   if (!tuh_hid_receive_report(dev_addr, idx)) {
     DEBUG_PRINTF("Error: cannot request initial report (dev_addr=%u idx=%u)\r\n", dev_addr, idx);
   }
+
+  s_hid_mount_count++;
+  update_hid_led();
 }
 
 void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t idx) {
@@ -399,6 +423,11 @@ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t idx) {
   if (tracked) {
     tracked->in_use = false;
   }
+
+  if (s_hid_mount_count > 0) {
+    s_hid_mount_count--;
+  }
+  update_hid_led();
 }
 
 void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t idx, const uint8_t *report, uint16_t len) {
