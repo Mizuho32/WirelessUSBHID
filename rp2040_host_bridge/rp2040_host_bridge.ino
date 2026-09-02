@@ -19,6 +19,24 @@
 
 #include "Adafruit_TinyUSB.h"
 
+// Dormant sleep (mds/usb_hid/2026-08-31_rp2040_sleep_plan.md) - base
+// pico-sdk calls only. Tried pico-sdk's own official pico_low_power
+// library first (this core's bundled pico-sdk has it, unlike pico-extras'
+// older pico_sleep, which this core doesn't bundle at all) - rejected
+// after it turned out to hard-fail the link: low_power.c is compiled
+// (inside this core's prebuilt lib/rp2040/libpico.a) with tinyusb-aware
+// USB shutdown/restart around the actual dormant call (tuh_deinit()/
+// tuh_init()), which drags in libpico.a's own bundled copy of TinyUSB -
+// a straight-up "multiple definition" clash against this sketch's real
+// TinyUSB Host stack (Adafruit_TinyUSB_Arduino, a separate full copy
+// compiled per-sketch for actual USB Host operation, USE_TINYUSB_HOST).
+// See enter_rp2040_dormant() below for the hand-rolled sequence instead.
+#include "hardware/clocks.h"
+#include "hardware/gpio.h"
+#include "hardware/pll.h"
+#include "hardware/xosc.h"
+#include "pico/runtime_init.h" // clocks_init() - see enter_rp2040_dormant()
+
 #ifndef USE_TINYUSB_HOST
 #error This sketch requires "Tools -> USB Stack -> Adafruit TinyUSB Host (native)"
 #endif
@@ -40,7 +58,20 @@ Adafruit_USBH_Host USBHost;
 // max_interval_us) - safe to memcpy as a struct since both RP2040 (ARM,
 // Cortex-M0+) and ESP32-S3 (Xtensa) are little-endian.
 #define BRIDGE_MSG_STATS      0x05
+// ESP32->RP2040 direction (opposite of everything above) - see
+// mds/usb_hid/2026-08-31_rp2040_sleep_plan.md and usb_host_rp2040_bridge.c's
+// matching enum. Both len=0. BRIDGE_CMD_WAKE's *content* doesn't actually
+// do anything here - by the time this sketch's UART is back up to parse
+// it, the dormant wake (a GPIO edge, not a parsed command) has already
+// happened. It's sent anyway so this side has something to log to confirm
+// the post-wake resync worked.
+#define BRIDGE_CMD_SLEEP      0x06
+#define BRIDGE_CMD_WAKE       0x07
 #define BRIDGE_BAUD           460800
+// GP1 doubles as Serial1's RX pin and the dormant-wake GPIO - see
+// enter_rp2040_dormant(). Must match usb_host_rp2040_bridge.c's
+// BRIDGE_UART_RX_PIN wiring (cross-connected: ESP32 TX -> this pin).
+#define BRIDGE_UART_RX_PIN    1
 
 #define HEARTBEAT_INTERVAL_MS 500
 
@@ -238,6 +269,147 @@ static void send_frame(uint8_t msg_type, uint8_t dev_addr, uint8_t idx, uint8_t 
   Serial1.write(checksum);
 }
 
+// Puts the chip into dormant sleep, blocking until a falling edge on
+// BRIDGE_UART_RX_PIN wakes it (armed below) - see
+// mds/usb_hid/2026-08-31_rp2040_sleep_plan.md. Dormants the crystal (XOSC),
+// not the ROSC - so, unlike pico_low_power's own ROSC-sourced dormant path
+// (rejected above), ROSC is never touched here and needs no explicit
+// restart on the way back.
+//
+//   1. Detach clk_ref/clk_sys from their PLLs onto the crystal directly,
+//      *before* stopping it. Skipping this is the actual failure mode in
+//      raspberrypi/pico-extras#41 ("Pico doesn't wake up properly from
+//      Dormant/Sleep") - clk_sys stays routed through pll_sys, whose
+//      reference (XOSC) is about to vanish; when XOSC comes back, the PLL
+//      doesn't just relock on its own, and clk_sys can end up wedged.
+//   2. Stop clk_adc/clk_usb (unused while dormant) and deinit both PLLs -
+//      nothing should still expect either of them running once XOSC stops.
+//   3. Reconfigure the RX pin as a plain GPIO input and arm the dormant
+//      wake IRQ on it (falling edge = a UART start bit, whether that's a
+//      real BRIDGE_CMD_WAKE frame or just the next heartbeat).
+//   4. xosc_dormant() - actually stops the crystal. Execution freezes here
+//      (this function doesn't return by executing further instructions -
+//      clk_sys itself has stopped) until the armed GPIO edge restarts it,
+//      at which point xosc_dormant() resumes running and returns once
+//      XOSC reports stable again.
+//   5. Undo it: acknowledge the GPIO IRQ, then run clocks_init() to fully
+//      rebuild every clock from scratch (the same routine a cold boot
+//      uses) rather than trying to carefully reverse just the specific
+//      registers touched above, then bring Serial1 back.
+//
+// UNVERIFIED ON REAL HARDWARE as of this writing - see
+// mds/usb_hid/2026-08-31_rp2040_sleep_plan.md's 未検証 section (mainly:
+// whether a 460800bps UART start bit's ~2us low pulse reliably trips the
+// dormant GPIO edge detector, and how connected HID devices react to
+// their host's clocks stopping). If this hangs instead of waking,
+// recovery is a normal BOOTSEL reflash (nothing is corrupted/persisted),
+// but it does mean physical access is needed - exactly why
+// usb_suspend_rp2040_sleep defaults off on the ESP32 side
+// (mruby_filter.h) until confirmed working.
+static void enter_rp2040_dormant(void) {
+  DEBUG_PRINTF("SLEEP cmd received - entering dormant\r\n");
+  digitalWrite(LED_BUILTIN, LOW);
+
+  Serial1.end();
+  gpio_init(BRIDGE_UART_RX_PIN);
+  gpio_set_input_enabled(BRIDGE_UART_RX_PIN, true);
+  gpio_set_dormant_irq_enabled(BRIDGE_UART_RX_PIN, GPIO_IRQ_EDGE_FALL, true);
+
+  clock_configure(clk_ref, CLOCKS_CLK_REF_CTRL_SRC_VALUE_XOSC_CLKSRC, 0,
+                  XOSC_MHZ * MHZ, XOSC_MHZ * MHZ);
+  clock_configure(clk_sys, CLOCKS_CLK_SYS_CTRL_SRC_VALUE_CLK_REF, 0,
+                  XOSC_MHZ * MHZ, XOSC_MHZ * MHZ);
+  clock_stop(clk_adc);
+  clock_stop(clk_usb);
+  pll_deinit(pll_sys);
+  pll_deinit(pll_usb);
+
+  xosc_dormant(); // blocks until woken
+
+  gpio_acknowledge_irq(BRIDGE_UART_RX_PIN, GPIO_IRQ_EDGE_FALL);
+  clocks_init();
+
+  Serial1.begin(BRIDGE_BAUD);
+  update_hid_led();
+  DEBUG_PRINTF("woke from dormant sleep\r\n");
+}
+
+// ── Incoming (ESP32->RP2040) command parser ────────────────────────
+// Mirrors usb_host_rp2040_bridge.c's own parser field-for-field (same
+// frame format, opposite direction), but only BRIDGE_CMD_SLEEP/_WAKE exist
+// so far and both are len=0 - any payload bytes are just consumed and
+// discarded to stay in sync with the checksum, not stored anywhere.
+enum {
+  CST_WAIT_SYNC, CST_TYPE, CST_ADDR, CST_IDX, CST_PROTO, CST_LEN_LO, CST_LEN_HI, CST_PAYLOAD, CST_CHECKSUM,
+};
+
+static uint8_t  s_cmd_state = CST_WAIT_SYNC;
+static uint8_t  s_cmd_msg_type;
+static uint16_t s_cmd_len, s_cmd_payload_idx;
+static uint8_t  s_cmd_checksum;
+
+static void handle_cmd_frame(void) {
+  switch (s_cmd_msg_type) {
+    case BRIDGE_CMD_SLEEP:
+      enter_rp2040_dormant();
+      break;
+    case BRIDGE_CMD_WAKE:
+      DEBUG_PRINTF("WAKE cmd received (already awake - informational only)\r\n");
+      break;
+    default:
+      DEBUG_PRINTF("unknown incoming msg_type 0x%02x, ignoring\r\n", s_cmd_msg_type);
+      break;
+  }
+}
+
+static void feed_cmd_byte(uint8_t b) {
+  switch (s_cmd_state) {
+    case CST_WAIT_SYNC:
+      if (b == BRIDGE_SYNC_BYTE) s_cmd_state = CST_TYPE;
+      break;
+    case CST_TYPE:
+      s_cmd_msg_type = b;
+      s_cmd_checksum = b;
+      s_cmd_state = CST_ADDR;
+      break;
+    case CST_ADDR:
+      s_cmd_checksum ^= b;
+      s_cmd_state = CST_IDX;
+      break;
+    case CST_IDX:
+      s_cmd_checksum ^= b;
+      s_cmd_state = CST_PROTO;
+      break;
+    case CST_PROTO:
+      s_cmd_checksum ^= b;
+      s_cmd_state = CST_LEN_LO;
+      break;
+    case CST_LEN_LO:
+      s_cmd_len = b;
+      s_cmd_checksum ^= b;
+      s_cmd_state = CST_LEN_HI;
+      break;
+    case CST_LEN_HI:
+      s_cmd_len |= (uint16_t)((uint16_t)b << 8);
+      s_cmd_checksum ^= b;
+      s_cmd_payload_idx = 0;
+      s_cmd_state = (s_cmd_len == 0) ? CST_CHECKSUM : CST_PAYLOAD;
+      break;
+    case CST_PAYLOAD:
+      s_cmd_checksum ^= b;
+      if (++s_cmd_payload_idx >= s_cmd_len) s_cmd_state = CST_CHECKSUM;
+      break;
+    case CST_CHECKSUM:
+      if (b == s_cmd_checksum) {
+        handle_cmd_frame();
+      } else {
+        DEBUG_PRINTF("incoming cmd checksum mismatch (msg_type=0x%02x), resyncing\r\n", s_cmd_msg_type);
+      }
+      s_cmd_state = CST_WAIT_SYNC;
+      break;
+  }
+}
+
 #if POLL_CEILING_TEST
 // Blocking, interactive measurement - see the POLL_CEILING_TEST comment
 // above. Runs USBHost.task() itself in a tight loop for the duration
@@ -313,6 +485,10 @@ void setup() {
 
 void loop() {
   USBHost.task();
+
+  while (Serial1.available()) {
+    feed_cmd_byte((uint8_t)Serial1.read());
+  }
 
   uint32_t now = millis();
 
