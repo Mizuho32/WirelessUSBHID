@@ -35,7 +35,6 @@
 #include "hardware/gpio.h"
 #include "hardware/pll.h"
 #include "hardware/xosc.h"
-#include "pico/runtime_init.h" // clocks_init() - see enter_rp2040_dormant()
 
 #ifndef USE_TINYUSB_HOST
 #error This sketch requires "Tools -> USB Stack -> Adafruit TinyUSB Host (native)"
@@ -92,7 +91,7 @@ Adafruit_USBH_Host USBHost;
 // it, so it can't be used for debug output at all once acting as Host
 // (same reason Serial1 had to be repurposed for the bridge protocol
 // instead of debug text in the first place).
-#define BRIDGE_DEBUG 0
+#define BRIDGE_DEBUG 1
 
 // Toggle for a running reports/sec counter, printed on Serial2 once a
 // second (mds/usb_hid/2026-08-24_rp2040_bridge_fps_investigation.md measurement
@@ -292,18 +291,26 @@ static void send_frame(uint8_t msg_type, uint8_t dev_addr, uint8_t idx, uint8_t 
 //      clk_sys itself has stopped) until the armed GPIO edge restarts it,
 //      at which point xosc_dormant() resumes running and returns once
 //      XOSC reports stable again.
-//   5. Undo it: acknowledge the GPIO IRQ, then run clocks_init() to fully
-//      rebuild every clock from scratch (the same routine a cold boot
-//      uses) rather than trying to carefully reverse just the specific
-//      registers touched above, then bring Serial1 back.
+//   5. xosc_dormant() returning means we're awake again, but the USB Host
+//      controller doesn't survive the trip - clk_usb was stopped in step 2,
+//      and nothing here re-drives root-port reset/re-enumeration for
+//      USBHost/TinyUSB afterwards. Confirmed on real hardware
+//      (mds/usb_hid/2026-09-02_rp2040_sleep_impl.md): a single directly-
+//      attached device comes back with corrupted bridge-UART traffic
+//      (something is still arriving, worse the more the device moves, but
+//      TinyUSB's own state is desynced from the controller), and a
+//      downstream hub doesn't come back at all - its port-status/interrupt
+//      endpoint handshaking with the now-confused host controller never
+//      recovers. A full chip reset (physical RST) always fixes it, so
+//      rather than try to carefully resume USBHost in place, just do that
+//      in software instead - see rp2040.reboot() below.
 //
-// UNVERIFIED ON REAL HARDWARE as of this writing - see
+// UNVERIFIED ON REAL HARDWARE beyond the above as of this writing - see
 // mds/usb_hid/2026-08-31_rp2040_sleep_plan.md's 未検証 section (mainly:
 // whether a 460800bps UART start bit's ~2us low pulse reliably trips the
-// dormant GPIO edge detector, and how connected HID devices react to
-// their host's clocks stopping). If this hangs instead of waking,
-// recovery is a normal BOOTSEL reflash (nothing is corrupted/persisted),
-// but it does mean physical access is needed - exactly why
+// dormant GPIO edge detector). If xosc_dormant() itself hangs instead of
+// waking, recovery is a normal BOOTSEL reflash (nothing is corrupted/
+// persisted), but it does mean physical access is needed - exactly why
 // usb_suspend_rp2040_sleep defaults off on the ESP32 side
 // (mruby_filter.h) until confirmed working.
 static void enter_rp2040_dormant(void) {
@@ -326,12 +333,10 @@ static void enter_rp2040_dormant(void) {
 
   xosc_dormant(); // blocks until woken
 
-  gpio_acknowledge_irq(BRIDGE_UART_RX_PIN, GPIO_IRQ_EDGE_FALL);
-  clocks_init();
-
-  Serial1.begin(BRIDGE_BAUD);
-  update_hid_led();
-  DEBUG_PRINTF("woke from dormant sleep\r\n");
+  // Warm chip reset (watchdog_reboot() under the hood) - never returns.
+  // setup() runs fresh from here, including a clean USBHost.begin(), same
+  // as a physical RST - see the comment above.
+  rp2040.reboot();
 }
 
 // ── Incoming (ESP32->RP2040) command parser ────────────────────────
