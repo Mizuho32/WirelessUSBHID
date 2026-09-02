@@ -91,7 +91,7 @@ Adafruit_USBH_Host USBHost;
 // it, so it can't be used for debug output at all once acting as Host
 // (same reason Serial1 had to be repurposed for the bridge protocol
 // instead of debug text in the first place).
-#define BRIDGE_DEBUG 1
+#define BRIDGE_DEBUG 0
 
 // Toggle for a running reports/sec counter, printed on Serial2 once a
 // second (mds/usb_hid/2026-08-24_rp2040_bridge_fps_investigation.md measurement
