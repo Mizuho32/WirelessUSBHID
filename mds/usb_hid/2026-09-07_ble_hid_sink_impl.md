@@ -1,6 +1,6 @@
 # Host role: BLE HID出力 実装メモ
 
-[2026-09-07_ble_hid_sink_plan.md](2026-09-07_ble_hid_sink_plan.md)の実装。ビルドは両ロールとも通った。実機検証は完了(下記「実機検証で見つかったバグと修正」参照) - 基本機能(ペアリング・再接続・キーボード/マウス/Consumer送信)は動作確認済み。既知の制限事項が1件残っている(マウスFPS低下、末尾参照)。
+[2026-09-07_ble_hid_sink_plan.md](2026-09-07_ble_hid_sink_plan.md)の実装。ビルドは両ロールとも通った。実機検証は完了(下記「実機検証で見つかったバグと修正」参照) - 基本機能(ペアリング・再接続・キーボード/マウス/Consumer送信)は動作確認済み。マウスFPS低下は接続インターバル要求+レポート積算(下記「マウスFPS改善」参照)で実用上許容できるレベルまで改善済み。
 
 ## 実装済み
 
@@ -62,6 +62,22 @@ D NimBLE: ble_hs_hci_cmd_send: ogf=0x08 ocf=0x001b len=2   ← LE Long Term Key 
 **原因**: `hid_forwarder.c`のキーボード/マウス/Consumerの3つの報告経路すべてが、`usb_device_typec_connected()`(実際にPCへ列挙された状態)が真の時**だけ**mrubyのdispatch関数(`:typec`/`:udp`/`:ble`全シンクの入口)を呼ぶ作りになっていた。mruby以前・BLE以前(Type-Cが唯一の出力先だった頃)の設計の名残りで、mruby導入後・BLE追加後もこの外側のゲートだけ更新されていなかった。`usb_device_typec_*_report()`自体は未接続時に即座に戻る安全なno-opなので、このゲート自体が不要だった。
 
 **修正**: mruby有効時(`mruby_filter_active()`)は、Type-C接続状態に関係なく常にdispatch関数を呼ぶよう変更。C版フォールバック(`filter_rules.h`/`route_rules.h`、mruby未使用時)側の挙動は変えていない。
+
+## マウスFPS改善
+
+「UDP/Type-Cは問題ないのでBLE固有」という見立てのもと、2段階で対策した。実機確認済み・実用上許容できるレベルまで改善(体感で明確に改善したが、完全にUSB並みにはならない)。
+
+### 1. 接続インターバルを明示的に要求していなかった
+
+`esp_hid_gap.c`にも`esp_hid`本体(`nimble_hidd.c`)にも、接続確立後にコネクションインターバルを短く要求するコードが一切無かった。存在していた`itvl_min`/`itvl_max`(30〜50ms)は**アドバタイズ**間隔で、接続後のデータ交換間隔とは別物。放置すると間隔はPC(central)側のデフォルト任せになり、市販BLEマウス/キーボードが標準的に行う「接続直後に短い間隔を自分から要求する」動作をしていなかった。
+
+**修正**: `esp_hid_gap.c`の`BLE_GAP_EVENT_CONNECT`ハンドラで`ble_gap_update_params()`を呼び、`itvl_min=6`/`itvl_max=12`(1.25ms単位 = 7.5ms/15ms、**BLEスペック上の絶対最速**)・`latency=0`を要求するようにした。
+
+### 2. 送信失敗時にdx/dy等の移動量がそのまま消えていた
+
+BLEは1接続イベントにつき1回しかGATT通知を送れない(`ble_gatts_notify_custom()`→`ble_att_clt_tx_notify()`はキューイングせず、前回分が電波に乗り切る前に呼ぶと単に失敗する)。USBマウスの生サンプルの方が接続インターバルより速いと、たまに送信が失敗し(`mouse report send failed`ログの正体)、しかもその回のdx/dy/wheel/panをそのまま捨てていた。
+
+**修正**: `ble_hid_device_mouse_report()`に送信失敗時の積算バッファを追加。失敗した回のdx/dy/wheel/panを次回の呼び出しに持ち越して合算(HIDマウスレポートは相対値なので合算で正しい)。フィールド幅(dx/dy: 16bit符号あり、wheel/pan: 8bit符号あり)を超える分はクランプ。接続/切断イベントで積算をリセットし、古い蓄積が再接続時に大きなジャンプとして出ないようにした。buttonsは絶対状態なので積算対象外(次回の実サンプルが自然と正しい値を持つ)。
 
 ## その他の調整・未解決事項
 
