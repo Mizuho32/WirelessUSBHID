@@ -84,9 +84,15 @@ Heap summary for capabilities 0x00000804:
 - 起動時のスクリプト読み込み(`mruby_filter_init()`、同じくPrismパース)が普段失敗しないのは、BLE/NimBLEがまだ何も確保していない・一番空きが多いタイミングで走るから。パース自体の重さは変わらないはず。
 - `mruby_filter_check_syntax()`用の使い捨てVMは`mrb_open_core()`→`mrb_basic_alloc_func()`(素の`malloc()`/`realloc()`)経由で内部SRAM限定(`SPIRAM_USE_CAPS_ALLOC`下では`malloc()`はPSRAMを一切使わない - 本プロジェクトの意図的な設定、[2026-08-30_mruby_phase2_webui.md](2026-08-30_mruby_phase2_webui.md)参照)。一方PSRAMは常時8MBほぼ丸ごと空いている。
 
-## 次にやること
+## 対策: syntax-check用VMだけPSRAMへ
 
-このVMだけPSRAMへ逃がす(`mrb_basic_alloc_func()`はmruby自身が「アプリ側での再定義」をサポートしていると明記 - `components/mruby/mruby/src/allocf.c`のコメント参照)。実装は別コミットで進める。
+実装済み(`esp32-kvm-ip`コミット`ba803f9`)。
+
+- `main/mruby_alloc_psram.c`/`.h`(新規): `mruby_alloc_prefer_psram(bool)`というグローバルなトグルと、それが有効な間だけ`heap_caps_realloc(..., MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT)`で確保する`mrb_basic_alloc_func()`の差し替え実装。無効な間は従来通り素の`realloc()`(内部SRAM限定)にフォールバックするので、このトグルを使わない限り完全に無害。`free()`側は差し替え不要(ESP-IDFの`free()`は`heap_caps_free()`に解決され、確保元のヒープ領域をポインタから自動判別するので、PSRAM由来のポインタも素の`free()`で正しく解放できる)。
+- `mrb_basic_alloc_func()`はmruby本体が「アプリ側での再定義」を公式にサポートしている拡張点(`components/mruby/mruby/src/allocf.c`のコメント参照)だが、mruby自身の(Rakefile駆動の)ビルドが`src/allocf.c`内の同名シンボルを既に`libmruby.a`に入れてしまうので、そのままでは重複定義でリンクエラーになる。`components/mruby/mruby`は素のupstream submoduleとして保つ方針(既存コメント通り)なので、submodule自体は書き換えず、`components/mruby/CMakeLists.txt`に`ar d libmruby.a allocf.o`でそのオブジェクトだけ取り除く`mruby_strip_allocf`カスタムターゲットを追加(既存の`mruby_build`と同じく「安全に毎回実行できる」設計 - 既に無いメンバーを`ar d`しても無害なexit 0であることを確認済み)。
+- `mruby_filter.c`の`mruby_filter_check_syntax()`は、このVM(`mrb_open_core()`〜`mrb_close()`)の生存期間だけ`mruby_alloc_prefer_psram(true)`/`(false)`で囲む。グローバル関数1本しかないため、本番の`s_mrb`が別タスクでたまたま同じ瞬間にGCしていたらそちらも巻き込まれてPSRAM行きになるが、実害はなく一瞬遅くなるだけ。
+
+実機ビルド確認: 両ロールとも変化なし(Host 25%空き、Device 74%空き)。`components/mruby/mruby/build`を丸ごと消してのクリーンビルドでも同じ手順で成功し、リンク後の`.map`ファイルで`mrb_basic_alloc_func`が`main/mruby_alloc_psram.c.obj`由来に切り替わっていることを確認済み。実機での最終確認(BLE有効・save)は今後行う。
 
 ## 保守用に残した診断コード
 
