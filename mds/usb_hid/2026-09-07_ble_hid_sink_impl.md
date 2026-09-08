@@ -1,6 +1,6 @@
 # Host role: BLE HID出力 実装メモ
 
-[2026-09-07_ble_hid_sink_plan.md](2026-09-07_ble_hid_sink_plan.md)の実装。ビルドは両ロールとも通った。実機検証は完了(下記「実機検証で見つかったバグと修正」参照) - 基本機能(ペアリング・再接続・キーボード/マウス/Consumer送信)は動作確認済み。マウスFPS低下は接続インターバル要求+レポート積算(下記「マウスFPS改善」参照)で実用上許容できるレベルまで改善済み。
+[2026-09-07_ble_hid_sink_plan.md](2026-09-07_ble_hid_sink_plan.md)の実装。ビルドは両ロールとも通った。実機検証は完了(下記「実機検証で見つかったバグと修正」参照) - 基本機能(ペアリング・再接続・キーボード/マウス/Consumer送信)は動作確認済み。マウスFPS低下は接続インターバル要求+レポート積算+WiFi/BT無線共存の切り分けと対策(下記「マウスFPS改善」参照)で実用上十分なレベルまで改善済み。
 
 ## 実装済み
 
@@ -79,13 +79,55 @@ BLEは1接続イベントにつき1回しかGATT通知を送れない(`ble_gatts
 
 **修正**: `ble_hid_device_mouse_report()`に送信失敗時の積算バッファを追加。失敗した回のdx/dy/wheel/panを次回の呼び出しに持ち越して合算(HIDマウスレポートは相対値なので合算で正しい)。フィールド幅(dx/dy: 16bit符号あり、wheel/pan: 8bit符号あり)を超える分はクランプ。接続/切断イベントで積算をリセットし、古い蓄積が再接続時に大きなジャンプとして出ないようにした。buttonsは絶対状態なので積算対象外(次回の実サンプルが自然と正しい値を持つ)。
 
+### 3. 真因の切り分け: WiFi/BT無線共存(coexistence)
+
+1・2の対策後も「実用上OK」レベルではあったが、まだ若干のガクガク感が残っていた。「市販BLEマウスは普通に使えるのに、UDP/Type-Cは問題ないのでBLE固有のはず」という疑問から、切り分け用の実験コードを用意して原因を特定した。
+
+**`HOST_BLE_ONLY_TEST`トグル**(`main_host.c`/`hid_forwarder.c`にそれぞれ`#define`、既存の`HOST_MINIMAL_TEST`/`BRIDGE_MINIMAL_TEST`と同じ「トグルで丸ごと切り離す」流儀 - 2ファイルとも1にして揃える必要あり):
+- `main_host.c`側: WiFi/mruby初期化/WebUI/Type-C/power_managerを全部スキップし、RP2040ブリッジとBLE HIDだけを起動(`:ble`宣言も不要 - 無条件に`ble_hid_device_start()`)。
+- `hid_forwarder.c`側: `hid_forwarder_keyboard_report()`/`_mouse_sample()`/`_consumer()`の入口で、mruby/UDP/Type-Cを一切通さず直接`ble_hid_device_*_report()`を呼ぶ。
+
+この状態でビルドするとFlash使用率が25%空き→83%空きまで減った(WiFi/mruby/WebUI関連コードがリンカでまるごとgcされ、実質「BLEだけ」のイメージになる)。
+
+**比較実験**(体感の粗い順位):
+
+| 構成 | 体感 |
+|---|---|
+| `HOST_BLE_ONLY_TEST`両方1(WiFi完全OFF) | 最も滑らか |
+| 通常ビルド + WiFiのパスワードを無効化(協会せず再試行のみ続く) | それよりやや劣るが通常よりずっと良い |
+| 通常ビルド(WiFi接続済み) | ガクガク |
+| `hid_forwarder.c`だけ`HOST_BLE_ONLY_TEST=1`(mrubyディスパッチのみバイパス、WiFiは通常通り接続) | 通常と同程度、ガクガクのまま |
+
+「通常」と「mrubyディスパッチのみバイパス」がほぼ同じ(=**mrubyの毎レポートのオーバーヘッドは無罪**)なのに対し、「WiFi無効化」〜「WiFi完全OFF」で明確に改善した。ESP32-S3はWiFiとBluetoothで同じ2.4GHzアンテナ/RFフロントエンドを共有しており、`esp_coex`が時分割で調停する - これが真因とほぼ確定した(最初のプランドキュメントで「一番の懸念はWiFi/BLEの無線共存によるレイテンシ」と当初から書いていた通り)。「WiFi完全OFF」と「パスワード無効化」の差は、後者でも約1秒おきの認証/アソシエーション再試行そのものが実際に電波を出している(=coexとまだ間欠的に衝突する)ためと考えられる。
+
+### 4. `esp_coex_preference_set()`でBT優先に
+
+ESP-IDFの`esp_coex_preference_set()`(デフォルトはWiFi優先)で、coexの調停をBT優先に明示的に振れる。`ble_hid_device_start()`内、`esp_hid_gap_init()`成功直後(WiFi/BTコントローラ両方起動済みのタイミング)で`esp_coex_preference_set(ESP_COEX_PREFER_BT)`を呼ぶよう追加(`esp_coex`コンポーネントをCMakeLists.txtのPRIV_REQUIRESに追加、`idf::mruby`より前にリンクする必要あり - 既存の`bt`/`esp_hid`と同じ理由)。
+
+実機確認: 若干改善した**気がする**程度で、「WiFiのパスワードを無効化」した状態にすら劣った。coexの優先度調整だけでは、WiFi自体が実際に電波を出し続けている限り限界がある。
+
+### 5. `ble_wifi_off_while_connected`(opt-in): BLE接続中はWiFiを止める
+
+根本対策として、「BLE HID接続がある間はWiFiを完全に止めてしまう」opt-inのmrubyトグルを追加。`power_manager.c`がUSBサスペンド連動の省電力に使っている既存の`wifi_manager_suspend()`/`wifi_manager_resume()`(`esp_wifi_stop()`/`esp_wifi_start()`のペア)をそのまま再利用。
+
+- `mruby_filter.c`/`.h`: `s_ble_wifi_off_while_connected`(デフォルト`false`)、DSL `ble_wifi_off_while_connected true`、getter `mruby_filter_ble_wifi_off_while_connected()`。`usb_suspend_wifi_sleep`(デフォルト`true`、PCのUSBサスペンドに反応)とは別軸 - こちらはBLEシンクが実際に使われている間だけ反応するので、WebUI/`:udp`シンクが同時に丸ごと止まるという明確なトレードオフがあり、デフォルト`false`(opt-in)にした。
+- `ble_hid_device.c`の`hidd_event_callback()`: `ESP_HIDD_CONNECT_EVENT`で`wifi_manager_suspend()`、`ESP_HIDD_DISCONNECT_EVENT`で`wifi_manager_resume()`(トグル有効時のみ、失敗してもBLE自体は継続)。
+
+実機確認: **「めっちゃ良くなった」**(ユーザー評)- 「WiFi完全OFF」の実験結果に匹敵する体感。マウスFPS問題は実質解決。
+
+### 6. 副作用: PCから明示的に切断してもすぐ再接続されてしまう
+
+5を有効にすると新たな問題が見えた: PC側のBluetooth設定から明示的に切断しても、ESP32が即座に再advertisingし、多くのOSの「ボンディング済みHIDデバイスは見えたら自動再接続する」ポリシーにより数秒以内に再接続されてしまう - `ble_wifi_off_while_connected`でWiFiを取り戻すための切断のはずが、window（猶予時間）がほぼ無い。
+
+**修正**: BLEの切断理由コード(NimBLEは`BLE_HS_ERR_HCI_BASE(0x200)` + 生のHCIエラーコードとして報告)で「意図的な切断」かどうかを判定。`BLE_ERR_REM_USER_CONN_TERM`(0x13、"Remote User Terminated Connection" - どちらか片方が明示的に切断した時にBluetoothスタックが送る理由コード)の場合のみ、`esp_timer`で30秒の再advertising遅延を入れる(`esp_timer_stop()`→`esp_timer_start_once()`)。電波が届かなくなっただけの切断(タイムアウト等、理由コードが違う)は今まで通り即座に再advertisingするので、通常の意図しない切断からの復帰は遅れない。
+
 ## その他の調整・未解決事項
 
 - **`ESP_HIDD_PROTOCOL_MODE_EVENT`診断ログが出ない**: 調査の結果、esp_hidのNimBLEバックエンド(`nimble_hidd.c`)はこのイベントを一度も発行しない実装だと判明(Bluedroidバックエンドの`ble_hidd.c`/`bt_hidd.c`だけがpostする)。ESP-IDF側の欠落で、こちら側の設定漏れではない。副次的に、`nimble_hidd.c`は接続確立の度にProtocol Mode属性を明示的にREPORTへリセットしていることも確認できたので、「Boot/Reportモードの取り違えでマウスレポートが誤ったキャラクタリスティックに配送される」という当初の仮説は優先度を下げた(構造上BootモードとReportモードの両方のキャラクタリスティックが存在しPCが両方subscribeしてくることは実際に確認できたが、実害があるかは未確認のまま)。
 - **NimBLE自身のログ(`notify_tx`/`GATT procedure`/`att_`系、"NimBLE"タグ)が出続ける**: レポート送信の度に出る`notify_tx`はコンソールを埋めるだけでなく、このプロジェクトで過去に実測済みの「UARTブロッキング出力がホットパスの遅延要因になる」現象([2026-08-24_rp2040_bridge_fps_investigation.md](2026-08-24_rp2040_bridge_fps_investigation.md))と同じ構図になっている疑いがある。
   - まず`CONFIG_BT_NIMBLE_LOG_LEVEL_WARNING`を試したが効果なし - 調査の結果、`MODLOG_DFLT()`(`modlog.h`)の実際のフィルタはKconfigのこの値ではなく、esp_logの**実行時**タグ別レベル(`esp_log_level_set()`、デフォルトは`CONFIG_LOG_DEFAULT_LEVEL`)で決まっていることが判明。
   - `esp_hid_gap_init()`冒頭で`esp_log_level_set("NimBLE", ESP_LOG_WARN)`を直接呼ぶよう変更 → 実機確認済み、**抑制できた**(直後の1回のテストでは変化が見えなかったが、再フラッシュ後の再検証で確認)。両方のKconfig変更(`CONFIG_BT_NIMBLE_LOG_LEVEL_WARNING`と併用)を残している。
-- **BLEルーティング時のマウスFPS低下**(実機確認済み、未解決): BLE経由でマウスを送ると、Type-C/UDP経由と比べて明らかに動きが粗くなる。上記のNimBLEログ垂れ流しは止まったので、これは別要因 - BLEの接続インターバル自体(Type-Cの数百Hzに対しBLEは規定上もっと粗い)による本質的な制約の可能性が高いが未検証。現状「動く」ところまでは確認できたが、レイテンシ/FPSの詰めは持ち越し。
+- **BLEルーティング時のマウスFPS低下**: 上記「マウスFPS改善」の3〜5で解決(WiFi/BT無線共存が真因、`ble_wifi_off_while_connected`で実用上十分なレベルまで改善)。BLEの接続インターバル自体(7.5ms=約133Hz)は変えられない絶対的な天井として残る。
 
 ## ビルドで踏んだハマりどころ
 
@@ -131,4 +173,5 @@ mruby-sprintfが`isspace()`/`isdigit()`等を呼んでおり、mrubyは独自の
 - `esp32-kvm-ip/main/esp_hid_gap.c`/`.h`(ベンダリング元: ESP-IDF `examples/bluetooth/esp_hid_device`)
 - `esp32-kvm-ip/main/mruby_ctype_shim.c`
 - `esp32-kvm-ip/main/CMakeLists.txt`のHOST role側コメント(`__getreent`/`_ctype_`の経緯を記載)
+- `esp32-kvm-ip/main/main_host.c`/`hid_forwarder.c`の`HOST_BLE_ONLY_TEST`トグル(切り分け用実験コード、デフォルトOFF)
 - [2026-09-07_ble_hid_sink_plan.md](2026-09-07_ble_hid_sink_plan.md) - 設計・決定事項
