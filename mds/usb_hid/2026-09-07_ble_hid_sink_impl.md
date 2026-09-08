@@ -1,6 +1,6 @@
 # Host role: BLE HID出力 実装メモ
 
-[2026-09-07_ble_hid_sink_plan.md](2026-09-07_ble_hid_sink_plan.md)の実装。ビルドは両ロールとも通った。実機検証は完了(下記「実機検証で見つかったバグと修正」参照) - 基本機能(ペアリング・再接続・キーボード/マウス/Consumer送信)は動作確認済み。マウスFPS低下は接続インターバル要求+レポート積算+WiFi/BT無線共存の切り分けと対策(下記「マウスFPS改善」参照)で実用上十分なレベルまで改善済み。
+[2026-09-07_ble_hid_sink_plan.md](2026-09-07_ble_hid_sink_plan.md)の実装。ビルドは両ロールとも通った。実機検証は完了(下記「実機検証で見つかったバグと修正」参照) - 基本機能(ペアリング・再接続・キーボード/マウス/Consumer送信)は動作確認済み。マウスFPS低下は接続インターバル要求+レポート積算+WiFi/BT無線共存の切り分けと対策(下記「マウスFPS改善」参照)で実用上十分なレベルまで改善済み。WebUIの「Unpair」ボタンとステータスLEDの新パターンも実装済み(下記「Unpair UI・LED点滅」参照)。
 
 ## 実装済み
 
@@ -12,8 +12,7 @@
 
 ## 未実装(プランのまま持ち越し)
 
-- WebUIの「Unpair」ボタン(`ble_hid_device_unpair()`はもう用意済み、呼び出し口だけ未接続)
-- ステータスLEDの新パターン・WiFi優先ロジック
+現時点でなし - プランの項目は全て実装済み(下記「Unpair UI・LED点滅」参照)。
 
 ## 実機検証で見つかったバグと修正
 
@@ -121,6 +120,31 @@ ESP-IDFの`esp_coex_preference_set()`(デフォルトはWiFi優先)で、coexの
 
 **修正**: BLEの切断理由コード(NimBLEは`BLE_HS_ERR_HCI_BASE(0x200)` + 生のHCIエラーコードとして報告)で「意図的な切断」かどうかを判定。`BLE_ERR_REM_USER_CONN_TERM`(0x13、"Remote User Terminated Connection" - どちらか片方が明示的に切断した時にBluetoothスタックが送る理由コード)の場合のみ、`esp_timer`で30秒の再advertising遅延を入れる(`esp_timer_stop()`→`esp_timer_start_once()`)。電波が届かなくなっただけの切断(タイムアウト等、理由コードが違う)は今まで通り即座に再advertisingするので、通常の意図しない切断からの復帰は遅れない。
 
+## Unpair UI・LED点滅
+
+プランの「ペアリング」節(3)の残り2項目。`ble_hid_device_unpair()`自体は最初から用意済みだったので、呼び出し口(WebUI)と表示(LED)を追加した。
+
+### WebUIの「Unpair」ボタン
+
+`mruby_webui.c`に`POST /api/ble_unpair`(`ble_hid_device_unpair()`を呼ぶだけ)を追加、`index.html`にボタンを1つ追加(`sleepBtn`と同じ確認ダイアログ付きの単発POSTパターン)。`GET /api/status`にも`ble: <state>`の行を追加(`not declared by script` / `advertising / not paired` / `connected` の3値、`mruby_filter_ble_sink_declared()`と`ble_hid_device_connected()`から算出)。`mruby_webui.c`はHost roleでしかコンパイルされない(`main/CMakeLists.txt`のKVM_ROLE分岐)ので、`ble_hid_device.h`を弱シンボル無しで直接includeできる。
+
+`ble_hid_device_unpair()`の既存の挙動通り、declare前・未ペア・接続中いずれの状態でクリックしても安全(no-opか、ボンドストアのクリアのみ - 現在接続中のPCを強制切断はしない)。
+
+### ステータスLEDの新パターン
+
+`status_led.c`をリファクタ: 従来の「一定間隔トグル」用タイマー(`status_led_set_blinking()`、WiFi初回接続中)はそのまま残し、もう1本「非対称ステップ列を自己再スケジュールするワンショットタイマー」を追加(`status_led_set_ble_advertising()`)。パターンはON100ms→OFF100ms→ON100ms→OFF700msの1秒サイクル(「二度点滅+休止」)で、WiFiの均等トグルと見分けが付く形にした。
+
+優先度はプラン通り3段階:
+
+1. `status_led_set_blinking(true)`(WiFi初回接続中)が最優先 - 動いていれば他は無視。
+2. 直近の`status_led_set()`が`false`(WiFi未接続/USB suspend中)なら常時消灯 - BLEパターンはここでは絶対に出さない。
+3. 上記どちらでもなく(=WiFi接続済み・非suspend)`status_led_set_ble_advertising(true)`が有効なら二度点滅パターン。
+4. どれでもなければ点灯(従来通りの「正常」表示)。
+
+この優先度は`status_led.c`内の`refresh()`一箇所に集約し、3つのsetter(`status_led_set()`/`_set_blinking()`/`_set_ble_advertising()`)はいずれも「望む状態」フラグを更新して`refresh()`を呼ぶだけ。`status_led_set()`はWiFi接続ブリンクだけを明示的に解除する(既存の「blinkingに勝つ」契約を維持)が、BLEの「advertising中」フラグ自体は触らない - `ble_hid_device.c`だけが所有し、`power_manager.c`のUSB suspend/resumeのような無関係な呼び出しで消えてしまわないようにした(可視性は`s_solid_level`経由で自然に抑制される)。
+
+`ble_hid_device.c`側の呼び出し口は4箇所: `ESP_HIDD_START_EVENT`(advertising開始)、`ESP_HIDD_CONNECT_EVENT`(`false`に - 接続済みなのでadvertisingではない)、`ESP_HIDD_DISCONNECT_EVENT`の即時re-advertiseブランチ(`true`)とholdoffブランチ(`false` - 実際にadvertisingしていない30秒間は正直にsolid表示に戻す)、`readvertise_timer_cb()`(holdoff明け、`true`)。
+
 ## その他の調整・未解決事項
 
 - **`ESP_HIDD_PROTOCOL_MODE_EVENT`診断ログが出ない**: 調査の結果、esp_hidのNimBLEバックエンド(`nimble_hidd.c`)はこのイベントを一度も発行しない実装だと判明(Bluedroidバックエンドの`ble_hidd.c`/`bt_hidd.c`だけがpostする)。ESP-IDF側の欠落で、こちら側の設定漏れではない。副次的に、`nimble_hidd.c`は接続確立の度にProtocol Mode属性を明示的にREPORTへリセットしていることも確認できたので、「Boot/Reportモードの取り違えでマウスレポートが誤ったキャラクタリスティックに配送される」という当初の仮説は優先度を下げた(構造上BootモードとReportモードの両方のキャラクタリスティックが存在しPCが両方subscribeしてくることは実際に確認できたが、実害があるかは未確認のまま)。
@@ -173,5 +197,6 @@ mruby-sprintfが`isspace()`/`isdigit()`等を呼んでおり、mrubyは独自の
 - `esp32-kvm-ip/main/esp_hid_gap.c`/`.h`(ベンダリング元: ESP-IDF `examples/bluetooth/esp_hid_device`)
 - `esp32-kvm-ip/main/mruby_ctype_shim.c`
 - `esp32-kvm-ip/main/CMakeLists.txt`のHOST role側コメント(`__getreent`/`_ctype_`の経緯を記載)
+- `esp32-kvm-ip/main/status_led.c`/`.h`(LED優先度ロジック)、`esp32-kvm-ip/main/mruby_webui.c`+`webui/index.html`(Unpairボタン)
 - `esp32-kvm-ip/main/main_host.c`/`hid_forwarder.c`の`HOST_BLE_ONLY_TEST`トグル(切り分け用実験コード、デフォルトOFF)
 - [2026-09-07_ble_hid_sink_plan.md](2026-09-07_ble_hid_sink_plan.md) - 設計・決定事項

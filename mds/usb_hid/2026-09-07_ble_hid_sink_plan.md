@@ -48,8 +48,8 @@
 
 ## 未決定・要相談
 
-- `hid_report_parser.c`のレポート形式とBLE HID Reportディスクリプタの整合をどう取るか(共通化 or 変換層)
-- LEDの具体的な点滅パターン(間隔・回数)の詳細
+- ~~`hid_report_parser.c`のレポート形式とBLE HID Reportディスクリプタの整合をどう取るか(共通化 or 変換層)~~ → 実装・実機確認済み(下記参照)
+- ~~LEDの具体的な点滅パターン(間隔・回数)の詳細~~ → 実装済み: WiFi接続中は既存の250ms均等トグル、BLE advertising中はON100ms/OFF100ms/ON100ms/OFF700msの「二度点滅+休止」(1秒サイクル)。優先度もプラン通り(WiFi優先、BLE状態はWiFi接続済み・非suspend時のみ表示) - [2026-09-07_ble_hid_sink_impl.md](2026-09-07_ble_hid_sink_impl.md)の「Unpair UI・LED点滅」参照
 
 ## 未検証
 
