@@ -147,6 +147,7 @@ ESP-IDFの`esp_coex_preference_set()`(デフォルトはWiFi優先)で、coexの
 
 ## その他の調整・未解決事項
 
+- **BLE有効時、WebUIの「保存」がまれにOOMで失敗する**: 調査中→[2026-09-09_ble_webui_syntax_check_oom.md](2026-09-09_ble_webui_syntax_check_oom.md)参照。NimBLEの常駐フットプリントではなく、mrubyのPrismパーサ+codegenのピークメモリ需要がBLE常駐後の残りSRAMを超えることが真因と判明、PSRAM退避での対策を実装中。
 - **`ESP_HIDD_PROTOCOL_MODE_EVENT`診断ログが出ない**: 調査の結果、esp_hidのNimBLEバックエンド(`nimble_hidd.c`)はこのイベントを一度も発行しない実装だと判明(Bluedroidバックエンドの`ble_hidd.c`/`bt_hidd.c`だけがpostする)。ESP-IDF側の欠落で、こちら側の設定漏れではない。副次的に、`nimble_hidd.c`は接続確立の度にProtocol Mode属性を明示的にREPORTへリセットしていることも確認できたので、「Boot/Reportモードの取り違えでマウスレポートが誤ったキャラクタリスティックに配送される」という当初の仮説は優先度を下げた(構造上BootモードとReportモードの両方のキャラクタリスティックが存在しPCが両方subscribeしてくることは実際に確認できたが、実害があるかは未確認のまま)。
 - **NimBLE自身のログ(`notify_tx`/`GATT procedure`/`att_`系、"NimBLE"タグ)が出続ける**: レポート送信の度に出る`notify_tx`はコンソールを埋めるだけでなく、このプロジェクトで過去に実測済みの「UARTブロッキング出力がホットパスの遅延要因になる」現象([2026-08-24_rp2040_bridge_fps_investigation.md](2026-08-24_rp2040_bridge_fps_investigation.md))と同じ構図になっている疑いがある。
   - まず`CONFIG_BT_NIMBLE_LOG_LEVEL_WARNING`を試したが効果なし - 調査の結果、`MODLOG_DFLT()`(`modlog.h`)の実際のフィルタはKconfigのこの値ではなく、esp_logの**実行時**タグ別レベル(`esp_log_level_set()`、デフォルトは`CONFIG_LOG_DEFAULT_LEVEL`)で決まっていることが判明。
