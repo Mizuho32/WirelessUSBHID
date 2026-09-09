@@ -21,7 +21,7 @@ USB HID機器(複数、HUB経由)をワイヤレス化したい。
 - **アップロード方法**(どちらもリビルド不要、書き込み後は自動/手動でリセットが要る):
   - WebUI: WiFi接続後、基板のIP/hostnameへブラウザでアクセス(`http://<hostname または IP>/`) → textareaで編集 → Save(自動で再起動して反映)
   - シリアル: `bin/upload_mruby_script.py --port /dev/ttyACM0 path/to/script.rb`(ネイティブUSB-Cポート、外付けUART`/dev/ttyUSB0`ではない点に注意)
-- **DSL**: `source`/`sink`/`pipeline`/`from`/`to`/`branch`で入出力を名前付き部品として繋ぐ。`to`ブロックが変換付き接続(旧`filter_*`相当)、`branch`が条件付き無加工接続(旧`route_*_also_udp`相当)。イベントはSymbolキーのHash(`ev[:wheel]`等)
+- **DSL**: `source`/`sink`/`pipeline`/`from`/`to`/`branch`で入出力を名前付き部品として繋ぐ。`to`ブロックが変換付き接続(旧`filter_*`相当)、`branch`が条件付き無加工接続(旧`route_*_also_udp`相当)。イベントはSymbolキーのHash(`ev[:wheel]`等) - `:keyboard`/`:mouse`/`:consumer`ごとのフィールド一覧は`esp32-kvm-ip/README.md`の「mruby DSL: Event (ev) Reference」参照
 - 呼び出し元は`hid_forwarder.c`一箇所(USB Hostバックエンドがrp2040_bridge/max3421/native OTGどれでも共通)。どの物理USB Hostバックエンドを使うかもスクリプト側の`usb_host_backends(*syms)`で制御する
 - Cフォールバック版(`filter_rules.h`/`route_rules.h`、gitignore、`.example`をコピーして編集、どちらも未作成なら`filter_rules_default.h`/`route_rules_default.h`で素通し)は非常時の保険としてコード上は残っているが、通常の編集対象ではない
 - 詳細: `mds/usb_hid/2026-08-28_mruby_filter_route.md`(設計)、`mds/usb_hid/2026-08-29_mruby_phase1_impl.md`(実装・DSLリファレンス)、`mds/usb_hid/2026-08-30_mruby_phase2_webui.md`(WebUI)。旧C版の経緯は`mds/usb_hid/2026-08-21_filter_conv_route.md`, `mds/usb_hid/2026-08-23_filter_conv_router_with_max3421.md`
