@@ -61,10 +61,47 @@ esp_err_t httpd_stop(httpd_handle_t handle)
 
 Host/Device両ロールともビルド成功、Flash使用率は従来通り(Host 25%空き、Device 74%空き、変化なし)。実機での動作確認(WebUIからのStart/Stop、実際のストリーミング)は未実施 - 次回実機テストで確認予定。
 
+## フォローアップ: WebUIの自動リロード + 再起動をまたぐ永続化(NVS)
+
+スクリプトSave/firmware更新は毎回ボードを`esp_restart()`で再起動させる(`mruby_webui.c`)。デバッグ中は当然スクリプトを直しては保存を繰り返すので、素の実装のままだと:
+
+- 保存の度に「数秒後に手動でリロードして」と表示するだけ → 面倒
+- debug streamはRAM上の状態(`s_httpd`)なので再起動で必ず消える → Start/Stopを毎回押し直す羽目に
+
+という2つの摩擦があった。対応は次の2つ:
+
+### 1. WebUIの自動リロード(`index.html`)
+
+Save/Update firmwareの成功後(またはレスポンス受信前に接続が切れた場合)、`waitForBoardThenReload()`が`/api/status`を1秒間隔・最大30回ポーリングし、応答が返った時点で`location.reload()`。「保存 → 手動リロード」の2アクションを1つに縮めただけで、サーバー側の変更は無い。
+
+### 2. debug streamのon/off状態をNVSへ永続化(`debug_stream.c`)
+
+**検討した2案とコスト比較**:
+
+| 案 | 内容 | コスト |
+|---|---|---|
+| A. NVS永続化(採用) | Start/Stopした「意図」だけをNVSに1バイト保存、起動時に`debug_stream_init()`が読んで自動再開 | 小。`wifi_manager.c`の`nvs_open`/`nvs_get_*`/`nvs_set_*`/`nvs_commit`パターンをそのまま流用、ハードウェアには一切触れない |
+| B. mrubyスクリプト適用を`esp_restart()`無しでやる(VMだけ再起動) | `mruby_filter_init()`を再実行可能にし、スクリプトPOST時はボード全体ではなくmruby VMだけ作り直す | 大。`mruby_filter_init()`は起動時に一度だけ実行される前提で、USB Hostバックエンド選択(MAX3421E/native OTG/RP2040 bridge - 実ハードウェアのprobe/初期化)、`wifi_manager_start()`前後の順序、UDPソケットのbind/close、BLE HIDスタックの起動可否判定などと密結合している。「今動いてるパイプライン/ソース/シンクを安全に解体してから再構築する」処理を新設する必要があり、途中失敗時にハードウェアが中途半端な状態に落ちるリスクも増える |
+
+BよりAの方が明らかに低コストなので、Aを実装した。Bは「毎回のスクリプト編集で再起動自体をなくしたい」という要求が出てきたら改めて検討する話で、今回のdebug stream単体の要求には過剰。
+
+**実装**: `debug_stream.c`に`NVS_NAMESPACE "dbgstream"`を追加(`wifi_manager.c`の`"wifi_cache"`と同じやり方)。
+
+- `debug_stream_start()`成功時に`save_persisted_enabled(true)`
+- `debug_stream_stop()`時に`save_persisted_enabled(false)`(こちらが「明示的にOFFにした」という唯一の合図 - 電源断やクラッシュでは書き換わらない)
+- `debug_stream_init()`(起動時、`mruby_webui_start()`から呼ばれる - この時点で`wifi_manager_start()`済みなのでTCP/IPスレッドは動いている)が`load_persisted_enabled()`を見て、trueなら`debug_stream_start()`を即実行
+
+「毎回自動起動」ではなく「明示的にStopするまで自動起動し続ける」という要望通りの挙動 - 起動時に無条件でオンにするのではなく、あくまで直前の状態を引き継ぐだけ。
+
+### WebUIボタンもトグル化
+
+Start/Stopの2ボタンを1つのトグルボタンに統合。`/api/status`の`debug_stream: active/inactive`をページ読み込み時にパースしてボタンのラベルと`EventSource`の再接続を合わせる。これはNVSとは無関係 - ページの再読み込みだけならボード自体は再起動しないので、ボード側のRAM状態(`debug_stream_active()`)を都度読みに行くだけで十分だった。
+
 ## 参考
 
-- `esp32-kvm-ip/main/debug_stream.c`/`.h`
-- `esp32-kvm-ip/main/mruby_filter.c`の`dsl_debug_print()`/`ruby_debug_print_uart()`
+- `esp32-kvm-ip/main/debug_stream.c`/`.h`(`load_persisted_enabled()`/`save_persisted_enabled()`)
+- `esp32-kvm-ip/main/mruby_filter.c`の`dsl_debug_print()`/`ruby_debug_print_to()`
 - `esp32-kvm-ip/main/mruby_webui.c`の`debug_stream_start_post_handler()`/`debug_stream_stop_post_handler()`
-- `esp32-kvm-ip/main/webui/index.html`
+- `esp32-kvm-ip/main/webui/index.html`(`waitForBoardThenReload()`/`setDebugButtonState()`)
+- `esp32-kvm-ip/main/wifi_manager.c`(NVS読み書きの先例パターン)
 - `mds/usb_hid/2026-09-09_ble_webui_syntax_check_oom.md`(この機能をon-demand化した動機になった内部SRAM事情)
