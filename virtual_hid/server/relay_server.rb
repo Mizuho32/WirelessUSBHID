@@ -55,6 +55,7 @@ class UdpRelay < EM::Connection
 
   def receive_data(data)
     puts("[UDP] received #{data}")
+    #puts("[UDP] received #{data.unpack("B*")}")
     return unless valid_packet?(data)
 
     @clients.each do |ws|
