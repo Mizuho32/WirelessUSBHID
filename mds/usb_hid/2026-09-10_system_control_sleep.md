@@ -57,14 +57,60 @@ Consumer Controlと同じ3つの出力経路すべてに対応させた(片方�
 
 これで、Host roleがtype-c直結でもBLE経由でも、あるいはDevice role側の別ボードに中継する構成でも、`system_control`は同じ書き方で動く。
 
+## フォローアップ: 生の0xXX指定 + 他のSystem Control usage対応
+
+「他にもusageあるんじゃない? 0xXX直接指定でも送信できる?」という質問がきっかけで、初版の実装を見直した。
+
+### 初版の制約: TinyUSBテンプレートは3値限定
+
+初版は`TUD_HID_REPORT_DESC_SYSTEM_CONTROL()`(TinyUSBの既製テンプレート)をそのまま使っていたが、これは**Power Down/Sleep/Wake Upの3つのUsageを列挙し、2bitのArray fieldで「どれが押されたか(1/2/3、0=なし)」という圧縮インデックスを送る**方式。実際のHID Usage ID(0x81/0x82/0x83)はワイヤに乗らず、`usb_device_typec.c`/`ble_hid_device.c`側で「Usage ID → インデックス」への変換テーブル(`system_control_array_value()`)を挟んでいた。この方式のままだと4つ目以降のUsageを増やすには、レポート記述子のArray fieldを作り直す(Usageを列挙し直し、Logical Max/Report Sizeを広げる)必要があり、結局「テンプレートを捨てて自前で書く」のと変わらない。
+
+### 再設計: Consumer Controlと同じ「Usage Min/Max直接一致」方式
+
+Consumer Controlの`usage_id`フィールド(`TUD_HID_REPORT_DESC_CONSUMER()`)は最初から「Logical Minimum == Usage Minimum」というトリックを使っていて、**レポートに乗る値がそのまま実際のUsage ID**になっている(0 = Logical Minimum未満 = 「何も押されてない」という、HID Array fieldの標準的な解釈)。System Controlも同じ形に描き直せば、任意の連続したUsage範囲をそのまま生の値で送れる。
+
+- `usb_descriptors.c`: `TUD_HID_REPORT_DESC_SYSTEM_CONTROL()`をやめて、`HID_USAGE_MIN_N`/`HID_USAGE_MAX_N`/`HID_LOGICAL_MIN_N`/`HID_LOGICAL_MAX_N`で手書きの記述子に置き換え(Consumer/mouseのX/Yフィールドと同じ2バイトエンコーディング - 0x81は符号付き1バイトの範囲(+127まで)を超えるため2バイト表記が必須、Usage Min/Maxは符号無し扱いなので1バイトのままでよい)。
+- `ble_hid_device.c`のレポートマップも同じ範囲・同じ形に合わせて手書き修正。
+- `usb_device_typec_system_control_report()`/`ble_hid_device_system_control_report()`/Device role `hid_task.c`から変換テーブル(`system_control_array_value()`)を完全に削除 - `usage_id`をそのまま1バイトにキャストして送るだけになった。
+- `mruby_filter.c`: `system_control_usage_from_symbol()` → `system_control_usage_from_value()`に改名・拡張。**Integer(生のUsage ID)も受け付ける**ようになり、範囲外なら`system_control: usage 0x.. out of supported range (0x81-0x8F)`というエラーで弾く。シンボルも3つ→15個に拡充。
+
+### 対応範囲: 0x81-0x8F(連続した15個)
+
+`class/hid/hid.h`の`HID_USAGE_DESKTOP_SYSTEM_*`のうち、この範囲に収まる連続ブロックを丸ごとサポート:
+
+| Usage ID | シンボル | 内容 |
+|---|---|---|
+| 0x81 | `:power_down` | Power Down |
+| 0x82 | `:sleep` | Sleep |
+| 0x83 | `:wake_up` | Wake Up |
+| 0x84 | `:context_menu` | Context Menu |
+| 0x85 | `:main_menu` | Main Menu |
+| 0x86 | `:app_menu` | App Menu |
+| 0x87 | `:menu_help` | Menu Help |
+| 0x88 | `:menu_exit` | Menu Exit |
+| 0x89 | `:menu_select` | Menu Select |
+| 0x8A | `:menu_right` | Menu Right |
+| 0x8B | `:menu_left` | Menu Left |
+| 0x8C | `:menu_up` | Menu Up |
+| 0x8D | `:menu_down` | Menu Down |
+| 0x8E | `:cold_restart` | Cold Restart |
+| 0x8F | `:warm_restart` | Warm Restart |
+
+`system_control :context_menu, :sysctl_typec`のようにシンボルで呼んでも、`system_control 0x84, :sysctl_typec`と生のInteger(この範囲内)で呼んでも同じ結果になる。
+
+### 対応してないもの: 0xA0番台/0xB0番台(飛び地)
+
+この先にも`HID_USAGE_DESKTOP_SYSTEM_DOCK`(0xA0)/`UNDOCK`(0xA1)/`SETUP`(0xA2)/`BREAK`(0xA3)/`DEBUGGER_BREAK`(0xA4)/`SPEAKER_MUTE`(0xA7)/`HIBERNATE`(0xA8)、さらに`DISPLAY_INVERT`(0xB0)〜`DISPLAY_LCD_AUTOSCALE`(0xB7)といった値がUSB HID Usage Tables上に存在するが、0x8Fから飛んでいて連続していない(単一のUsage Min/Max宣言では表現できない)上、ラップトップのドック検知/デバッガ/ディスプレイ固有の用途が多く、このKVMプロジェクトで一般的に使う場面が思いつかなかったため今回は対象外にした。必要になったら2つ目のUsage Min/Maxブロックをレポート記述子に追加する形で対応可能(既存の0x81-0x8Fブロックには影響しない)。
+
 ## 実機ビルド確認
 
-Host role: ビルド成功、Flash使用率24%空き(既存の機能追加同様、ほぼ変化なし)。実機での動作確認(実際にターゲットPCがSleepすること自体)は未実施。
+Host role: 初版・再設計版とも ビルド成功、Flash使用率24%空き(既存の機能追加同様、ほぼ変化なし)。実機での動作確認(実際にターゲットPCがSleepすること自体)は未実施。Device roleのビルド確認は今回省略(Host roleが主眼のため)。
 
 ## 参考
 
-- `esp32-kvm-ip/main/mruby_filter.c`の`dsl_system_control()`/`system_control_usage_from_symbol()`/`send_system_control_to_sink()`
-- `esp32-kvm-ip/main/usb_device_typec.c`/`ble_hid_device.c`の`system_control_array_value()`(usage_id→wire値の変換、両ファイルに同内容を意図的に複製)
-- `esp32-kvm-ip/components/tinyusb/src/class/hid/hid_device.h`の`TUD_HID_REPORT_DESC_SYSTEM_CONTROL()`
+- `esp32-kvm-ip/main/mruby_filter.c`の`dsl_system_control()`/`system_control_usage_from_value()`/`send_system_control_to_sink()`
+- `esp32-kvm-ip/main/usb_descriptors.c`の手書きSystem Controlレポート記述子(`SYSTEM_CONTROL_USAGE_MIN`/`MAX`)
+- `esp32-kvm-ip/main/usb_device_typec.c`/`ble_hid_device.c`の`*_system_control_report()`(もう変換テーブルは無く、usage_idをそのまま1バイトにキャストするだけ)
+- `esp32-kvm-ip/components/tinyusb/src/class/hid/hid_device.h`の`TUD_HID_REPORT_DESC_CONSUMER()`(参考にした「Usage Min/Max == Logical Min/Max」トリックの元ネタ)
 - `esp32-kvm-ip/components/tinyusb/src/class/hid/hid.h`の`HID_USAGE_DESKTOP_SYSTEM_*`
 - `esp32-kvm-ip/main/mruby_scripts/default.rb`(使用例)
