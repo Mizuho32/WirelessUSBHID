@@ -7,11 +7,63 @@
 #
 # Usage: bin/build_host.sh [idf.py args...]
 #   bin/build_host.sh build flash monitor
+#
+# `flash -p <target>` is special-cased: if <target> looks like a serial
+# device (/dev/..., COM<N>), this is passed straight through to idf.py
+# as always (esptool over the cable). If it *doesn't* - anything else,
+# e.g. an IP address or a .local hostname - this is treated as a WiFi OTA
+# upload instead (mds/usb_hid/2026-09-10_wifi_ota.md): `flash` and `-p
+# <target>` are dropped from the idf.py invocation (replaced with a plain
+# `build`, since esptool's serial flash doesn't apply here) and
+# bin/upload_firmware.py --host <target> is run against the resulting
+# build.host/esp32-kvm-ip.bin afterwards. No Boot-mode button, no cable -
+# the board just needs to already be reachable on the network.
 
 if ! command -v idf.py; then
  source "${ESP_IDF}/export.sh"
 fi
 
 set -euo pipefail
-cd "$(dirname "${BASH_SOURCE[0]}")/../esp32-kvm-ip"
-exec idf.py -B build.host -D KVM_ROLE=HOST "$@"
+bin_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$bin_dir/../esp32-kvm-ip"
+
+args=("$@")
+filtered=()
+wifi_host=""
+want_flash=false
+i=0
+while [ $i -lt ${#args[@]} ]; do
+    a="${args[$i]}"
+    case "$a" in
+        flash)
+            want_flash=true
+            filtered+=("$a")
+            ;;
+        -p|--port)
+            i=$((i + 1))
+            val="${args[$i]:-}"
+            if [[ "$val" == /dev/* || "$val" == COM* ]]; then
+                filtered+=("$a" "$val")
+            else
+                wifi_host="$val"
+            fi
+            ;;
+        *)
+            filtered+=("$a")
+            ;;
+    esac
+    i=$((i + 1))
+done
+
+if [ "$want_flash" = true ] && [ -n "$wifi_host" ]; then
+    echo "WiFi OTA mode: uploading to $wifi_host instead of a serial flash (see this script's own comment)"
+    build_only=()
+    for a in "${filtered[@]}"; do
+        [ "$a" = "flash" ] || build_only+=("$a")
+    done
+    [ ${#build_only[@]} -eq 0 ] && build_only=(build)
+    idf.py -B build.host -D KVM_ROLE=HOST "${build_only[@]}"
+    exec "$bin_dir/upload_firmware.py" --host "$wifi_host" build.host/esp32-kvm-ip.bin
+fi
+
+exec idf.py -B build.host -D KVM_ROLE=HOST "${filtered[@]}"

@@ -26,6 +26,15 @@ USB HID機器(複数、HUB経由)をワイヤレス化したい。
 - Cフォールバック版(`filter_rules.h`/`route_rules.h`、gitignore、`.example`をコピーして編集、どちらも未作成なら`filter_rules_default.h`/`route_rules_default.h`で素通し)は非常時の保険としてコード上は残っているが、通常の編集対象ではない
 - 詳細: `mds/usb_hid/2026-08-28_mruby_filter_route.md`(設計)、`mds/usb_hid/2026-08-29_mruby_phase1_impl.md`(実装・DSLリファレンス)、`mds/usb_hid/2026-08-30_mruby_phase2_webui.md`(WebUI)。旧C版の経緯は`mds/usb_hid/2026-08-21_filter_conv_route.md`, `mds/usb_hid/2026-08-23_filter_conv_router_with_max3421.md`
 
+## ファームウェア更新(Host role、WiFi OTA)
+
+スクリプト/WebUI frontendだけでなく、ビルドしたアプリイメージ本体もケーブル無しで書き換えられる(`ota_0`/`ota_1`の2枠構成 + ロールバック - 新イメージが起動確認前にクラッシュ/リセットすると前のスロットへ自動で戻る)。
+
+- WebUI: 「Update firmware」でファイル選択(`build.host/esp32-kvm-ip.bin`)→アップロード(自動で再起動して反映)
+- CLI: `bin/upload_firmware.py --host <IPまたはhostname> [path/to/esp32-kvm-ip.bin]`(省略時`esp32-kvm-ip/build.host/esp32-kvm-ip.bin`)
+- `bin/build_host.sh flash -p <値>`は`<値>`がシリアルデバイス風(`/dev/...`, `COM<N>`)ならこれまで通りシリアル書き込み、そうでなければ(IP/hostname)自動的にWiFi OTAへ切り替わる(`bin/upload_firmware.py`を内部で呼ぶ)
+- 詳細: `mds/usb_hid/2026-09-10_wifi_ota.md`
+
 ## debug print類の場所
 
 - `esp32-kvm-ip/main/usb_host_rp2040_bridge.c`: `BRIDGE_RATE_MONITOR`(受信rate/interval統計)、`BRIDGE_MINIMAL_TEST`(WiFi/type-c/dispatch_task抜きの最小構成ビルド)
