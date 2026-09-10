@@ -9,7 +9,8 @@
 - **常時起動ではなく、WebUIの明示Start/Stopボタンでのみ起動/停止**。理由: 別インスタンスは「専用タスクのスタック+リスニング/クライアントソケットのバッファ」を常駐で食う。これは`mruby`のparseピークのような一時的消費と違い**ボードが起きてる間ずっと確保されっぱなし**になる負担で、`mds/usb_hid/2026-09-09_ble_webui_syntax_check_oom.md`で判明した「BLE常駐だけで内部SRAMのlargest_free_blockが61440→17408まで落ちる」という、ただでさえ厳しい内部SRAM事情にそのまま積み増しされる。見る時だけ払うコストにするため、on-demand化した。
 - Start/Stopは自動検知(タブを閉じたら自動停止、等)ではなく**ユーザーがWebUIから明示操作**(ユーザーの要望: 「WebUIは開きっぱなしにするとかあるので、デバッグしたいときだけユーザーUIから明示Star/Stopのが都合がいい」)。タブを閉じてもサーバー側は動き続けるので、見終わったら「Stop debug stream」を押す必要がある(index.htmlのヒントに明記)。
 - 過去ログ(バックログ)は保持しない。Start後に流れてきた分だけを表示する(シンプルさ優先)。
-- `debug_print`の出力先はUART(ESP_LOGI)とこのHTTPストリームの2つ。UARTはデフォルトON、スクリプトから`debug_print_uart false`でOFFにできる(既存の`usb_suspend_wifi_sleep`等と同じ、真偽値トグルのDSLパターン)。HTTPストリーム側はスクリプトのトグルではなく、WebUIのStart/Stop(=そのインスタンスが起動してるかどうか)そのものがゲートになる。
+- `debug_print`の出力先はUART(ESP_LOGI)とこのHTTPストリームの2つ。**`debug_print_to(*syms)`**(`:uart`/`:http`、`usb_host_backends(*syms)`と同じ「呼んだ内容で丸ごと置き換え」方式のDSL)で明示制御できる。デフォルトは`:uart`のみ(従来通りシリアルのみ)。`:http`を含めても、WebUIの「Start debug stream」を押してそのインスタンス自体が起動していない限り実際には届かない(`debug_print_to`とWebUIのStart/Stopは独立した2つのゲートで、両方が許可して初めてHTTPへ届く)。
+  - 最初は単純な真偽値トグル`debug_print_uart false`として実装したが、「もっと明示的に、UART/HTTPを個別指定できるAPIにしてほしい」というフィードバックを受けて`debug_print_to(:uart, :http)`に置き換えた。
 
 ## 実装
 
