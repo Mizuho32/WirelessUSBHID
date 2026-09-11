@@ -97,11 +97,42 @@ BよりAの方が明らかに低コストなので、Aを実装した。Bは「�
 
 Start/Stopの2ボタンを1つのトグルボタンに統合。`/api/status`の`debug_stream: active/inactive`をページ読み込み時にパースしてボタンのラベルと`EventSource`の再接続を合わせる。これはNVSとは無関係 - ページの再読み込みだけならボード自体は再起動しないので、ボード側のRAM状態(`debug_stream_active()`)を都度読みに行くだけで十分だった。
 
+## フォローアップ: 起動直後の`debug_print`が見えない問題(バックログをPSRAMに)
+
+実際にSystem Control/BLE周りのデバッグで「WebUIで様子見てたのに、起動直後(スクリプトの`sink`宣言などトップレベル実行中)のエラーだけ見えてない」という事象が発生した(`mds/usb_hid/2026-09-11_sink_limit_exhausted.md`参照 - `rescue`された`sink: too many sinks declared`がまさにこれで見つかった)。
+
+### 原因: タイミング競争ではなく順序の問題
+
+起動シーケンス:
+
+1. `mruby_filter_init()`(スクリプトのトップレベル実行 - `sink`/`pipeline`宣言、この中の`debug_print`呼び出しも含む) ← **WiFiすら始まってない**
+2. `wifi_manager_start()`
+3. `mruby_webui_start()` → この中で`debug_stream_init()`が初めて呼ばれ、SSEストリーム用のキューが初めて存在する
+
+つまり1の時点では、`debug_stream`のhttpdインスタンスはおろか**その裏のキューすら存在しない**。どれだけ素早くブラウザ側で`/stream`に繋いでも、1はとっくに終わっているので原理的に間に合わない - 単なるタイミング競争の敗北ではなく、受け口自体が無い期間の話。「reboot直後に急いでdebug streamを繋げば見える」という発想は成立しない。
+
+### 対応: SSEストリームとは別に、常時記録のバックログを`/api/status`に載せる
+
+SSEストリーム自体(過去ログ非保持、シンプルさ優先の設計 - このファイル冒頭の設計判断)はそのまま変えず、**別の小さい仕組み**を追加:
+
+- `debug_stream_record_recent(line)`(新規): 直近`DEBUG_BACKLOG_LINES`(16)行を保持するリングバッファに常に記録。`debug_stream_init()`を待たず、**最初の呼び出し時に遅延確保**するので、`mruby_filter_init()`の最初の`debug_print`からいきなり効く。`debug_print_to`の`:uart`/`:http`設定に関係なく常時記録(そもそもこのバックログは「見逃さないための保険」なので、出力先の選択とは独立させた)。
+- `debug_stream_recent_backlog(buf, size)`(新規): バックログを古い順に整形して返す。
+- `mruby_webui.c`の`/api/status`に「debug_print backlog (this boot, oldest first)」として追加 - これはWebUIが**ページ読み込みの度に無条件で叩いてる**エンドポイントなので、Save後の自動リロードでも普通のF5でも、その時点までの記録がそのまま見える。SSEのように「見てる間だけ」ではなく「次にページを開いた時」に効くのがポイント。
+
+### なぜPSRAM
+
+`heap_caps_malloc(..., MALLOC_CAP_SPIRAM)`で確保(内部SRAMには置かない)。理由:
+
+- このデータは低レイテンシが要らない(ページ読み込みの度に整形するだけ、mrubyのホットパスには一切乗らない)。
+- 内部SRAMはBLE常駐時に特に厳しい(`2026-09-09_ble_webui_syntax_check_oom.md`: BLE常駐だけでlargest_free_blockが61440→17408に低下) - `mruby_alloc_psram.c`がmrubyのヒープ自体をPSRAMへ逃がしてるのと同じ理由付け。
+- タイミング面の裏付け: 実機ログで`esp_psram: Adding pool of 8192K of PSRAM memory...`が`app_main()`より前(ブートローダ直後)に出ていることを確認済み - `mruby_filter_init()`の最初の呼び出し時点でも確実にPSRAMは使える。
+
 ## 参考
 
-- `esp32-kvm-ip/main/debug_stream.c`/`.h`(`load_persisted_enabled()`/`save_persisted_enabled()`)
+- `esp32-kvm-ip/main/debug_stream.c`/`.h`(`load_persisted_enabled()`/`save_persisted_enabled()`、`debug_stream_record_recent()`/`debug_stream_recent_backlog()`)
 - `esp32-kvm-ip/main/mruby_filter.c`の`dsl_debug_print()`/`ruby_debug_print_to()`
-- `esp32-kvm-ip/main/mruby_webui.c`の`debug_stream_start_post_handler()`/`debug_stream_stop_post_handler()`
+- `esp32-kvm-ip/main/mruby_webui.c`の`debug_stream_start_post_handler()`/`debug_stream_stop_post_handler()`/`status_get_handler()`
 - `esp32-kvm-ip/main/webui/index.html`(`waitForBoardThenReload()`/`setDebugButtonState()`)
 - `esp32-kvm-ip/main/wifi_manager.c`(NVS読み書きの先例パターン)
-- `mds/usb_hid/2026-09-09_ble_webui_syntax_check_oom.md`(この機能をon-demand化した動機になった内部SRAM事情)
+- `mds/usb_hid/2026-09-09_ble_webui_syntax_check_oom.md`(この機能をon-demand化した動機になった内部SRAM事情、PSRAM移動の先例)
+- `mds/usb_hid/2026-09-11_sink_limit_exhausted.md`(この問題が実際に発覚した経緯)
