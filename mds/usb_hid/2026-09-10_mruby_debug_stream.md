@@ -119,6 +119,15 @@ SSEストリーム自体(過去ログ非保持、シンプルさ優先の設計 
 - `debug_stream_recent_backlog(buf, size)`(新規): バックログを古い順に整形して返す。
 - `mruby_webui.c`の`/api/status`に「debug_print backlog (this boot, oldest first)」として追加 - これはWebUIが**ページ読み込みの度に無条件で叩いてる**エンドポイントなので、Save後の自動リロードでも普通のF5でも、その時点までの記録がそのまま見える。SSEのように「見てる間だけ」ではなく「次にページを開いた時」に効くのがポイント。
 
+### 表示先: 別枠ではなくdebug streamと同じログ欄へ統合
+
+最初は`/api/status`のテキストにそのまま埋め込んで、ステータス表示欄(`#status`)にプレーンテキストで出す形にしたが、「backlogもdebug streamも結局同じ`debug_print`の出力なんだから、表示を分ける必要ない」というフィードバックで統合した:
+
+- `index.html`側で`/api/status`のレスポンスから`BACKLOG_MARKER`(`"debug_print backlog (this boot, oldest first):\n"`)を目印に分割し、ステータス欄には残りの部分(mruby/hostname/ble等)だけを表示。
+- backlog本体は、SSEストリームと同じ`<pre id="debugLog">`へ`appendDebugLine()`で流し込む - ページ読み込み時に**1回だけ**(`backlogShown`フラグで多重投入防止)、`── boot-time backlog (before this page could watch live) ──`/`── live from here ──`という区切り行で挟んで見分けられるようにした。以降SSEで届くライブ分はそのまま続けて流れる。
+
+
+
 ### なぜPSRAM
 
 `heap_caps_malloc(..., MALLOC_CAP_SPIRAM)`で確保(内部SRAMには置かない)。理由:
