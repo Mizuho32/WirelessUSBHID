@@ -93,6 +93,15 @@
 
 引数無し = トグルが主な使い方になったので、「`_enable`より`toggle`の方が名前として素直」というフィードバックで改名(動作は変えていない、引数ありなら明示set・引数無しならトグル、両方とも従来通り)。`ble_hid_device.c`/`.h`、`mruby_filter.c`/`.h`、`main_host.c`、`default.rb`の全参照箇所を揃えて置換。
 
+## フォローアップ: 状態取得DSL(`ble_started?`/`ble_connected?`)
+
+「set(`ble_toggle`)はあるのにget(状態取得)が無いのはチグハグ」という指摘を受けて追加。`ble_hid_device_started()`/`ble_hid_device_connected()`をそのまま返すだけの読み取り専用DSL:
+
+- `ble_started?` - BLEスタック自体が起動中か(`s_started`)
+- `ble_connected?` - 起動中 **かつ** 実際にペアリング済み機器と接続中か(`s_started && s_connected`)
+
+`debug_print`と組み合わせて`ble_toggle`直後に今の状態をログする、といった使い方を想定(`default.rb`に例追加)。
+
 ## 参考
 
 - `esp32-kvm-ip/main/ble_hid_device.c`の`ble_hid_device_start()`/`_stop()`/`_started()`/`nimble_host_task()`
