@@ -1,0 +1,71 @@
+# BLE HIDスタックの動的ON/OFF(`ble_dynamic`/`ble_enable`)
+
+## 動機
+
+`sink :xxx, :ble, ...`を宣言すると、今まではボード起動時に自動でNimBLE/BTスタックが立ち上がり、そのまま起動中ずっと常駐し続ける一択だった。「普段はOFF(RAM/WiFi干渉を避ける)、ショートカットが押されたらON」という使い方をしたい、という要望。`sink :ble`自体は「宛先を宣言する」だけで、実際にスタックを起動するかどうかの決定はもっと別の場所(起動シーケンス中の一点)にあった - この切り離しがどこまで可能か調べた。
+
+## 調査: 起動/終了は本当に対称にできるか
+
+`ble_hid_device_start()`(既存実装)がやっていること:
+1. `esp_timer_create()`(切断後の再アドバタイズ保留用タイマ)
+2. `esp_hid_gap_init()` → BTコントローラ初期化・enable、`esp_nimble_init()`
+3. `esp_coex_preference_set(ESP_COEX_PREFER_BT)`
+4. `esp_hid_ble_gap_adv_init()` → GAP/セキュリティパラメータ設定
+5. `esp_hidd_dev_init()` → HID/GATTサービス登録
+6. `ble_store_config_init()` → NVSボンディングストア配線
+7. `nimble_port_freertos_init(nimble_host_task)` → NimBLEホストタスク起動(`nimble_port_run()`を回し続ける)
+
+これの逆(stop)が本当に安全にできるか、`esp_hid_gap.c`(ESP-IDFのexampleからvendorされたファイル)のソースを読んで確認した。結果: **既に対称なdeinit関数が用意されていた**(vendor元のexampleが元々BT/BLEモード切り替えデモを想定していたと思われる):
+
+- `esp_hid_gap_deinit()`(既存、今まで一度も呼ばれていなかった) → NimBLEなら`esp_nimble_deinit()` + `esp_bt_controller_disable()` + `esp_bt_controller_deinit()`
+- `esp_hidd_dev_deinit()`(`esp_hid`コンポーネント自体が提供) → 中身(`esp_hid/src/nimble_hidd.c`の`nimble_hid_stop_gatts()`、ソース確認済み)は「接続中なら`ble_gap_terminate()`で切断 → `ble_gatts_stop()` → HID/DIS/BAS/SPS/GATT/GAPサービスを個別にdeinit」を既にやってくれる
+
+つまり「対称なstopを新設する」というより、**既存の(未使用だった)deinitパスをつなぎ直すだけ**で済んだ。
+
+## 実装
+
+### 起動/終了シーケンス(`ble_hid_device_stop()`、新規)
+
+`ble_hid_device_start()`の逆順:
+
+1. 再アドバタイズ保留タイマを止める(消さない - 後述)。放置すると、deinit後にコールバックが発火して既に無いBTコントローラへ`esp_hid_ble_gap_adv_start()`しに行く事故になる。
+2. `ble_gap_adv_stop()`(アドバタイズ中でなければ黙って無視)
+3. `esp_hidd_dev_deinit()` - 接続中なら切断も含めて丸ごと片付く
+4. `nimble_port_stop()` + セマフォ待ち → NimBLEホストタスクの終了を確認してから
+5. `esp_hid_gap_deinit()`(BTコントローラのdisable/deinit)
+6. `esp_coex_preference_set(ESP_COEX_PREFER_WIFI)` - BT優先だった設定を戻す
+
+### `nimble_port_stop()`は非同期 → セマフォで同期化
+
+`nimble_port_stop()`はNimBLEホストのイベントループに「止まれ」と要求するだけで、実際に止まったことをブロックして待ってはくれない。`nimble_port_run()`が実際に返ってきてから`nimble_port_freertos_deinit()`(このタスク自身を`vTaskDelete(NULL)`で消す)を呼ぶ、という流れなので、`ble_hid_device_stop()`側が「ホストタスクが本当に終わった」のを確認してからBTコントローラのdisable/deinitに進まないと、ホストタスクがまだ後片付け中のところへコントローラを引っこ抜く競合になりうる。
+
+対策: `nimble_host_task()`内、`nimble_port_run()`が返った直後(`nimble_port_freertos_deinit()`でこのタスク自体が消される直前)にバイナリセマフォを`give`し、`ble_hid_device_stop()`側は`nimble_port_stop()`の直後にそのセマフォを`take`して待つ。ESP-IDFのNimBLE系サンプルでよく見るstop/restartの定番パターン。
+
+### タイマ・セマフォは「常駐」、スタック本体だけ動的
+
+`debug_stream.c`(`mds/usb_hid/2026-09-10_mruby_debug_stream.md`)と同じ設計判断: 再アドバタイズ用`esp_timer_handle_t`とホスト停止待ち用`SemaphoreHandle_t`は初回`ble_hid_device_start()`で一度だけ作り、以降は`stop()`で消さずそのまま使い回す(固定・小さいコストのプリミティブは不滅にしておく方が、毎回作り直す複雑さを避けられる)。実際にRAM/無線を食う本体(BTコントローラ・NimBLEホスト・GATTサービス)だけがstart/stopのたびに生成・破棄される。
+
+## DSL
+
+- **`ble_dynamic true`**(スクリプトのトップレベルでのみ意味を持つ): デフォルトfalse = 従来通り「`:ble`宛先が1つでもあれば起動時に自動でスタート」。trueにすると、`main_host.c`はそのチェックをスキップする(`mruby_filter_ble_sink_declared() && !mruby_filter_ble_dynamic()`)。**この判定は`mruby_filter_init()`が返った直後、ディスパッチが始まる前の一点でしか行われない**ため、ランタイム中(ショートカット検出後など)に`ble_dynamic`を呼んでも手遅れ - あくまでスクリプト本体のトップレベルで宣言するもの。
+- **`ble_enable(true/false)`**: `ble_hid_device_start()`/`_stop()`を直接呼ぶ一発アクション。`system_control`と同じ「いつでもどこからでも呼べる」設計 - 典型的には`:keyboard`パイプラインの`to`/`branch`ブロック内でショートカット検出時に呼ぶ。
+
+## 既知のトレードオフ: 呼び出し元をブロックする
+
+`system_control`の20msパルス待ちと違い、`ble_enable`はBTコントローラ/NimBLEホストの実際の起動・終了にかかる時間(おそらく数十〜数百ms程度、実測はまだ)だけ**呼び出し元をブロックする**。`ble_enable`は典型的にmrubyのディスパッチパス内(`s_mrb_mutex`保持中)から呼ばれるので、その間**他の全パイプライン(マウス含む)も止まる**。頻繁に起きる操作ではなく、明示的なユーザー操作(ショートカット)なので許容できる設計判断とした - `system_control`のブロッキングも同じ理由で受け入れている前例に倣った。実機で体感どの程度の長さになるかは未検証。
+
+## 未検証・今後の懸念
+
+- **実機での動作確認は未実施**。特に「start → stop → start」の複数サイクルが本当に安定して繰り返せるか(BTコントローラの再初期化はESP32系では割とデリケートな領域として知られている)は、コードレベルの調査(`esp_hid_gap.c`が対称なinit/deinitペアを既に持っている、`esp_hidd_dev_deinit()`の中身を実装ソースまで読んだ)止まりで、実機での複数回切り替えはまだ試していない。
+- `ble_store_config_init()`(NVSボンディング永続化の配線)を毎回の`start()`で再度呼んでいるが、二重登録的な副作用が無いかは未確認(ただの関数ポインタ登録なので理論上は冪等のはず)。
+- stop中に切断されたPC側が持つ「まだペアリングされてるはず」という認識とのズレ(stopしてもボンディング自体はNVSに残るので、再度startすれば普通に再接続できる想定 - これも実機未確認)。
+
+## 参考
+
+- `esp32-kvm-ip/main/ble_hid_device.c`の`ble_hid_device_start()`/`_stop()`/`nimble_host_task()`
+- `esp32-kvm-ip/main/esp_hid_gap.c`の`esp_hid_gap_init()`/`_deinit()`(vendor元から既に対称なペアだった)
+- `esp32-kvm-ip/components/esp_hid/src/nimble_hidd.c`(ESP-IDF本体、vendorしていない)の`nimble_hid_stop_gatts()`/`nimble_hidd_dev_deinit()`
+- `esp32-kvm-ip/main/mruby_filter.c`の`ruby_ble_dynamic()`/`ruby_ble_enable()`/`mruby_filter_ble_dynamic()`
+- `esp32-kvm-ip/main/main_host.c`のBLE自動起動チェック
+- `esp32-kvm-ip/main/mruby_scripts/default.rb`(トグル例)
+- `mds/usb_hid/2026-09-10_mruby_debug_stream.md`(「小さい常駐プリミティブ+動的な本体」という同じ設計パターンの前例)
