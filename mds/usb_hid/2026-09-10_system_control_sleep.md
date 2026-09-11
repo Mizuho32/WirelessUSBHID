@@ -102,9 +102,45 @@ Consumer Controlの`usage_id`フィールド(`TUD_HID_REPORT_DESC_CONSUMER()`)�
 
 この先にも`HID_USAGE_DESKTOP_SYSTEM_DOCK`(0xA0)/`UNDOCK`(0xA1)/`SETUP`(0xA2)/`BREAK`(0xA3)/`DEBUGGER_BREAK`(0xA4)/`SPEAKER_MUTE`(0xA7)/`HIBERNATE`(0xA8)、さらに`DISPLAY_INVERT`(0xB0)〜`DISPLAY_LCD_AUTOSCALE`(0xB7)といった値がUSB HID Usage Tables上に存在するが、0x8Fから飛んでいて連続していない(単一のUsage Min/Max宣言では表現できない)上、ラップトップのドック検知/デバッガ/ディスプレイ固有の用途が多く、このKVMプロジェクトで一般的に使う場面が思いつかなかったため今回は対象外にした。必要になったら2つ目のUsage Min/Maxブロックをレポート記述子に追加する形で対応可能(既存の0x81-0x8Fブロックには影響しない)。
 
+## フォローアップ: `CONFIG_BT_NIMBLE_SVC_HID_MAX_RPTS`更新漏れ(BLE Consumer sinkが動かなくなる報告から発覚)
+
+`sink :ble_cc, :ble, kind: :consumer`を有効にすると動かなくなる、という実機での報告を受けて調査。
+
+`sdkconfig.defaults`に元々こういうコメントがあった:
+
+> esp_hid's NimBLE HOGP backend (nimble_hidd.c) is entirely compiled out without this ... Its default CONFIG_BT_NIMBLE_SVC_HID_MAX_RPTS=3 already matches ble_hid_device.c's 3 report IDs (keyboard/mouse/consumer), so left unset.
+
+System Controlを追加してBLEのreport-mode報告が4種類(keyboard/mouse/consumer/system_control)になった時、**このKconfig値を3のまま放置していた**。`esp_hid`(`components/bt/host/nimble/.../services/hid/src/nimble_hidd.c`の`create_hid_db()`)を実際に読むと:
+
+```c
+for (...) {
+    if (report->protocol_mode == ESP_HID_PROTOCOL_MODE_REPORT) {
+        if (report_mode_rpts >= MAX_REPORTS) {   // MAX_REPORTS = CONFIG_BT_NIMBLE_SVC_HID_MAX_RPTS
+            ESP_LOGE(TAG, "Too many report-mode reports (%d >= MAX_REPORTS); truncating", report_mode_rpts);
+            break;   // 以降のレポートは一切登録されない、エラーは戻り値に伝播しない
+        }
+        ...
+        report_mode_rpts++;
+    } else {
+        // Boot mode複製(keyboard/mouseのみ)は別フラグ(kbd_inp_present等)で無条件登録 - このカウントに含まれない
+    }
+}
+```
+
+Keyboard/MouseのBoot mode複製はこのカウントに含まれない(別経路で無条件登録)。カウントされる"report-mode"エントリは、レポートマップのバイト列順(= `s_ble_hid_report_map`内の宣言順)通りに: Keyboard(1)→Mouse(2)→Consumer(3)→System Control(4)。`MAX_REPORTS=3`のまま追跡すると:
+
+- Keyboard: `0>=3`? no → 登録、count=1
+- Mouse: `1>=3`? no → 登録、count=2
+- Consumer: `2>=3`? no → 登録、count=3
+- System Control: `3>=3`? **yes** → **ここで無言でループごと打ち切り**(エラーはログに出るだけで、呼び出し元には伝播しない)
+
+**この経路を厳密に追う限り、切り捨てられるのはConsumerではなくSystem Controlのはず**(Consumerはちょうど3番目で枠内に収まる計算になる)。なので、報告された「Consumerが動かなくなる」症状をこれだけで完全に説明できるかは不明 - ただし`CONFIG_BT_NIMBLE_SVC_HID_MAX_RPTS=3`が古いままなのは確実な不整合で、System Controlを使う場合は確実に踏む問題のため修正した(3→4、`sdkconfig.defaults`のコメントも更新)。
+
+Consumer自体の不具合は、コードを読む限りでは特定できず、実機ログ(`ESP_LOGE`/`ESP_LOGW`、特に"NIMBLE_HIDD"/"BLE_HID"/"NimBLE"タグ、"Too many report-mode reports"の有無)の確認が必要。
+
 ## 実機ビルド確認
 
-Host role: 初版・再設計版とも ビルド成功、Flash使用率24%空き(既存の機能追加同様、ほぼ変化なし)。実機での動作確認(実際にターゲットPCがSleepすること自体)は未実施。Device roleのビルド確認は今回省略(Host roleが主眼のため)。
+Host role: 初版・再設計版・`MAX_RPTS`修正版いずれもビルド成功、Flash使用率24%空き(既存の機能追加同様、ほぼ変化なし)。実機での動作確認(実際にターゲットPCがSleepすること、およびConsumer/System ControlのBLE経路そのもの)は未実施。Device roleのビルド確認は今回省略(Host roleが主眼のため)。
 
 ## 参考
 
