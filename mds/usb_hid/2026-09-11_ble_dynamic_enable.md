@@ -1,4 +1,4 @@
-# BLE HIDスタックの動的ON/OFF(`ble_dynamic`/`ble_enable`)
+# BLE HIDスタックの動的ON/OFF(`ble_dynamic`/`ble_toggle`)
 
 ## 動機
 
@@ -48,8 +48,8 @@
 ## DSL
 
 - **`ble_dynamic true`**(スクリプトのトップレベルでのみ意味を持つ): デフォルトfalse = 従来通り「`:ble`宛先が1つでもあれば起動時に自動でスタート」。trueにすると、`main_host.c`はそのチェックをスキップする(`mruby_filter_ble_sink_declared() && !mruby_filter_ble_dynamic()`)。**この判定は`mruby_filter_init()`が返った直後、ディスパッチが始まる前の一点でしか行われない**ため、ランタイム中(ショートカット検出後など)に`ble_dynamic`を呼んでも手遅れ - あくまでスクリプト本体のトップレベルで宣言するもの。
-- **`ble_enable(true/false)`**: `ble_hid_device_start()`/`_stop()`を直接呼ぶ一発アクション。`system_control`と同じ「いつでもどこからでも呼べる」設計 - 典型的には`:keyboard`パイプラインの`to`/`branch`ブロック内でショートカット検出時に呼ぶ。
-- **`ble_enable()`(引数無し)= トグル**(フォローアップ、後述)。
+- **`ble_toggle(true/false)`**: `ble_hid_device_start()`/`_stop()`を直接呼ぶ一発アクション。`system_control`と同じ「いつでもどこからでも呼べる」設計 - 典型的には`:keyboard`パイプラインの`to`/`branch`ブロック内でショートカット検出時に呼ぶ。
+- **`ble_toggle()`(引数無し)= トグル**(フォローアップ、後述)。
 
 ## 配線(宣言的)と生死(動的)は別軸 - `sink`/`to`/`branch`はいつも通り常に有効
 
@@ -64,13 +64,13 @@
 
 - 配線(pipeline)は最初から常に有効 - キーボードレポートが来るたびに、`:ble_kbd`宛先への送信関数(`send_keyboard_to_sink()`等)は毎回律儀に呼ばれる。
 - ただしBLEスタック自体(`s_started`)が起動していなければ、その送信関数は`ble_hid_device_connected()`(`s_started && s_connected`)を見て即return - 呼ばれてはいるが何もしない。
-- `ble_enable true`がやっているのは「配線を有効化する」ことではなく、**その配線の先にある無線スタック自体を立ち上げる**こと。立ち上がって接続もできれば`s_started && s_connected`がtrueになり、最初から存在していた配線が初めて実際にデータを流し始める。
+- `ble_toggle true`がやっているのは「配線を有効化する」ことではなく、**その配線の先にある無線スタック自体を立ち上げる**こと。立ち上がって接続もできれば`s_started && s_connected`がtrueになり、最初から存在していた配線が初めて実際にデータを流し始める。
 
-これはBLEで初めて出てきた考え方ではなく、**`:typec`宛先も昔から同じ構造**だったことに気づいた: `to :typec_kbd`という配線自体は常に静的に存在していて、実際に送るかどうかは`usb_device_typec_connected()`(PCが挿さって認識されているか)という**別軸のランタイム状態**で毎回チェックされている。`ble_dynamic`/`ble_enable`は、その「配線は静的、生死は動的」という既存の構造に、もう一段(無線自体の電源ON/OFF)を足しただけ - 静的な宣言モデルと動的なON/OFFは元々そういう役割分担になっている。
+これはBLEで初めて出てきた考え方ではなく、**`:typec`宛先も昔から同じ構造**だったことに気づいた: `to :typec_kbd`という配線自体は常に静的に存在していて、実際に送るかどうかは`usb_device_typec_connected()`(PCが挿さって認識されているか)という**別軸のランタイム状態**で毎回チェックされている。`ble_dynamic`/`ble_toggle`は、その「配線は静的、生死は動的」という既存の構造に、もう一段(無線自体の電源ON/OFF)を足しただけ - 静的な宣言モデルと動的なON/OFFは元々そういう役割分担になっている。
 
 ## 既知のトレードオフ: 呼び出し元をブロックする
 
-`system_control`の20msパルス待ちと違い、`ble_enable`はBTコントローラ/NimBLEホストの実際の起動・終了にかかる時間(おそらく数十〜数百ms程度、実測はまだ)だけ**呼び出し元をブロックする**。`ble_enable`は典型的にmrubyのディスパッチパス内(`s_mrb_mutex`保持中)から呼ばれるので、その間**他の全パイプライン(マウス含む)も止まる**。頻繁に起きる操作ではなく、明示的なユーザー操作(ショートカット)なので許容できる設計判断とした - `system_control`のブロッキングも同じ理由で受け入れている前例に倣った。実機で体感どの程度の長さになるかは未検証。
+`system_control`の20msパルス待ちと違い、`ble_toggle`はBTコントローラ/NimBLEホストの実際の起動・終了にかかる時間(おそらく数十〜数百ms程度、実測はまだ)だけ**呼び出し元をブロックする**。`ble_toggle`は典型的にmrubyのディスパッチパス内(`s_mrb_mutex`保持中)から呼ばれるので、その間**他の全パイプライン(マウス含む)も止まる**。頻繁に起きる操作ではなく、明示的なユーザー操作(ショートカット)なので許容できる設計判断とした - `system_control`のブロッキングも同じ理由で受け入れている前例に倣った。実機で体感どの程度の長さになるかは未検証。
 
 ## 未検証・今後の懸念
 
@@ -78,23 +78,27 @@
 - `ble_store_config_init()`(NVSボンディング永続化の配線)を毎回の`start()`で再度呼んでいるが、二重登録的な副作用が無いかは未確認(ただの関数ポインタ登録なので理論上は冪等のはず)。
 - stop中に切断されたPC側が持つ「まだペアリングされてるはず」という認識とのズレ(stopしてもボンディング自体はNVSに残るので、再度startすれば普通に再接続できる想定 - これも実機未確認)。
 
-## フォローアップ: `ble_enable`引数無し = トグル
+## フォローアップ: `ble_toggle`引数無し = トグル
 
-初版は`ble_enable(true/false)`の明示指定のみで、トグルさせたいスクリプト側は自前で状態(on/offのHash)を持って管理する必要があった。「引数無しでトグルできないか」という提案を受けて対応。
+初版は`ble_toggle(true/false)`の明示指定のみで、トグルさせたいスクリプト側は自前で状態(on/offのHash)を持って管理する必要があった。「引数無しでトグルできないか」という提案を受けて対応。
 
 - `ble_hid_device.c`に`ble_hid_device_started()`(新規)を追加 - `ble_hid_device_connected()`(スタック起動中 **かつ** 接続中)と違い、**スタックが起動中かどうかだけ**を返す(`s_started`そのもの)。
-- `ruby_ble_enable()`(mruby_filter.c)が`mrb_get_argc(mrb) == 0`なら`!ble_hid_device_started()`で自動的に反転、引数があれば従来通りその値をそのまま使う。DSL登録も`MRB_ARGS_REQ(1)` → `MRB_ARGS_OPT(1)`に変更。
+- `ruby_ble_toggle()`(mruby_filter.c)が`mrb_get_argc(mrb) == 0`なら`!ble_hid_device_started()`で自動的に反転、引数があれば従来通りその値をそのまま使う。DSL登録も`MRB_ARGS_REQ(1)` → `MRB_ARGS_OPT(1)`に変更。
 
-スクリプト側で状態をHashに持たせる旧方式より**正確**でもある: もし`ble_enable true`が何らかの理由で失敗していても(`s_started`が実際にはfalseのまま)、スクリプト側の自己申告のフラグはtrueのまま食い違いうるが、`ble_hid_device_started()`を都度見て反転する新方式なら実際の状態と食い違わない。
+スクリプト側で状態をHashに持たせる旧方式より**正確**でもある: もし`ble_toggle true`が何らかの理由で失敗していても(`s_started`が実際にはfalseのまま)、スクリプト側の自己申告のフラグはtrueのまま食い違いうるが、`ble_hid_device_started()`を都度見て反転する新方式なら実際の状態と食い違わない。
 
-`default.rb`の使用例もこれに合わせて簡略化(`ble_state = { enabled: false }`的なHash管理コードを削除、`ble_enable`を素で呼ぶだけに)。
+`default.rb`の使用例もこれに合わせて簡略化(`ble_state = { enabled: false }`的なHash管理コードを削除、`ble_toggle`を素で呼ぶだけに)。
+
+## フォローアップ: `ble_enable` → `ble_toggle`に改名
+
+引数無し = トグルが主な使い方になったので、「`_enable`より`toggle`の方が名前として素直」というフィードバックで改名(動作は変えていない、引数ありなら明示set・引数無しならトグル、両方とも従来通り)。`ble_hid_device.c`/`.h`、`mruby_filter.c`/`.h`、`main_host.c`、`default.rb`の全参照箇所を揃えて置換。
 
 ## 参考
 
 - `esp32-kvm-ip/main/ble_hid_device.c`の`ble_hid_device_start()`/`_stop()`/`_started()`/`nimble_host_task()`
 - `esp32-kvm-ip/main/esp_hid_gap.c`の`esp_hid_gap_init()`/`_deinit()`(vendor元から既に対称なペアだった)
 - `esp32-kvm-ip/components/esp_hid/src/nimble_hidd.c`(ESP-IDF本体、vendorしていない)の`nimble_hid_stop_gatts()`/`nimble_hidd_dev_deinit()`
-- `esp32-kvm-ip/main/mruby_filter.c`の`ruby_ble_dynamic()`/`ruby_ble_enable()`/`mruby_filter_ble_dynamic()`
+- `esp32-kvm-ip/main/mruby_filter.c`の`ruby_ble_dynamic()`/`ruby_ble_toggle()`/`mruby_filter_ble_dynamic()`
 - `esp32-kvm-ip/main/main_host.c`のBLE自動起動チェック
 - `esp32-kvm-ip/main/mruby_scripts/default.rb`(トグル例)
 - `mds/usb_hid/2026-09-10_mruby_debug_stream.md`(「小さい常駐プリミティブ+動的な本体」という同じ設計パターンの前例)
