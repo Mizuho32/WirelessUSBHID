@@ -50,6 +50,23 @@
 - **`ble_dynamic true`**(スクリプトのトップレベルでのみ意味を持つ): デフォルトfalse = 従来通り「`:ble`宛先が1つでもあれば起動時に自動でスタート」。trueにすると、`main_host.c`はそのチェックをスキップする(`mruby_filter_ble_sink_declared() && !mruby_filter_ble_dynamic()`)。**この判定は`mruby_filter_init()`が返った直後、ディスパッチが始まる前の一点でしか行われない**ため、ランタイム中(ショートカット検出後など)に`ble_dynamic`を呼んでも手遅れ - あくまでスクリプト本体のトップレベルで宣言するもの。
 - **`ble_enable(true/false)`**: `ble_hid_device_start()`/`_stop()`を直接呼ぶ一発アクション。`system_control`と同じ「いつでもどこからでも呼べる」設計 - 典型的には`:keyboard`パイプラインの`to`/`branch`ブロック内でショートカット検出時に呼ぶ。
 
+## 配線(宣言的)と生死(動的)は別軸 - `sink`/`to`/`branch`はいつも通り常に有効
+
+「`to`/`branch`って宣言的・静的に配線を組む仕組みなのに、`ble_dynamic`みたいな動的ON/OFFと相性悪くない?」という疑問が出たが、実際には競合しない。**`sink`/`to`/`branch`による配線は、`ble_dynamic`の値に関わらず、スクリプト読み込み時に無条件でいつも通り登録される** - これは一切変えていない:
+
+- `sink :name, :ble, kind: :xxx` → `s_sinks[]`への登録は毎回そのまま起きる。
+- `to :typec_kbd, :ble_kbd`(pipeline内) → `s_pipelines[PIPE_KEYBOARD]`への静的な配線も毎回そのまま起きる。
+
+`ble_dynamic true`が変えるのは**ただ1点**: 起動直後に`main_host.c`が自動で`ble_hid_device_start()`を呼ぶかどうか、それだけ。配線自体は`ble_dynamic`の設定と無関係に、スクリプトが読み込まれた瞬間から常に「活性化」済みになっている。
+
+実際に起きていること:
+
+- 配線(pipeline)は最初から常に有効 - キーボードレポートが来るたびに、`:ble_kbd`宛先への送信関数(`send_keyboard_to_sink()`等)は毎回律儀に呼ばれる。
+- ただしBLEスタック自体(`s_started`)が起動していなければ、その送信関数は`ble_hid_device_connected()`(`s_started && s_connected`)を見て即return - 呼ばれてはいるが何もしない。
+- `ble_enable true`がやっているのは「配線を有効化する」ことではなく、**その配線の先にある無線スタック自体を立ち上げる**こと。立ち上がって接続もできれば`s_started && s_connected`がtrueになり、最初から存在していた配線が初めて実際にデータを流し始める。
+
+これはBLEで初めて出てきた考え方ではなく、**`:typec`宛先も昔から同じ構造**だったことに気づいた: `to :typec_kbd`という配線自体は常に静的に存在していて、実際に送るかどうかは`usb_device_typec_connected()`(PCが挿さって認識されているか)という**別軸のランタイム状態**で毎回チェックされている。`ble_dynamic`/`ble_enable`は、その「配線は静的、生死は動的」という既存の構造に、もう一段(無線自体の電源ON/OFF)を足しただけ - 静的な宣言モデルと動的なON/OFFは元々そういう役割分担になっている。
+
 ## 既知のトレードオフ: 呼び出し元をブロックする
 
 `system_control`の20msパルス待ちと違い、`ble_enable`はBTコントローラ/NimBLEホストの実際の起動・終了にかかる時間(おそらく数十〜数百ms程度、実測はまだ)だけ**呼び出し元をブロックする**。`ble_enable`は典型的にmrubyのディスパッチパス内(`s_mrb_mutex`保持中)から呼ばれるので、その間**他の全パイプライン(マウス含む)も止まる**。頻繁に起きる操作ではなく、明示的なユーザー操作(ショートカット)なので許容できる設計判断とした - `system_control`のブロッキングも同じ理由で受け入れている前例に倣った。実機で体感どの程度の長さになるかは未検証。
