@@ -77,6 +77,23 @@ I (77987) BLE_HID: started   ← ble_pair_newの呼び出しより30ms *後*に�
 
 ビルド・フラッシュ済み。この特定の競合(`ble_toggle true`直後の`ble_pair_new`)が直ったかは実機再検証が必要。
 
+## 追記2: ペアリングはできるがBLE入力が全滅する(実機ログで発見)
+
+`ble_pair_new`でペアリング自体は成功したが、キーボード/マウス/consumer全部BLE側で反応しない(type-c出力は無事 - 別経路なので無関係)。ログ:
+
+```
+I ESP_HID_GAP: subscribe event; conn_handle=1 attr_handle=49 reason=1 prevn=0 curn=1 previ=0 curi=0
+E NimBLE: ble_store_config_write_cccd rc=27
+```
+
+`rc=27`は`BLE_HS_ESTORE_CAP`。`ble_gatts_clt_cfg_access()`(CCCD書き込みのATTハンドラ、実装は`ble_gatts.c`)を読むと、`ble_store_write_cccd()`の戻り値を**そのままピアへのATT応答として返してる**のを確認 - つまりストア容量オーバーは「保存し損ねるだけ」ではなく、**購読リクエスト自体がその場で失敗する**。
+
+`CONFIG_BT_NIMBLE_MAX_CCCDS`(全ボンド合計のグローバル上限、デフォルト8)に対し、このHIDは1台につき6個のCCCD(キーボード boot+report、マウス boot+report、Consumer Control、System Control)を必要とする。1台分だけで既にほぼ上限で、3スロット分のボンドを同時に保持するようになった結果、実機で本当に溢れた。
+
+**対処**: `sdkconfig.defaults`で`CONFIG_BT_NIMBLE_MAX_CCCDS=24`(3スロット×6 + 予備)に変更。ビルド・フラッシュ済み。
+
+**注意**: 既存のボンド/CCCDストア(NVS)は今回の変更前に溜まった分がそのまま残ってる可能性がある。WebUIの「Unpair」ボタン(`ble_hid_device_unpair()`、`ble_store_clear()` + `ble_pair_slots_forget_all()`)で一度全部クリアしてから試すのを推奨。
+
 ## 未検証
 
 - 実機でのダイレクト広告の動作確認(意図した相手だけ繋がるか)は未確認。
