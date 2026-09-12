@@ -58,6 +58,25 @@ NimBLEの`ble_gap_adv_start()`は`direct_addr`引数に特定の相手のBLEア�
 - `main/nimble_hidd_fork.c`/`.h`: `dev_p->disconnect`がupstreamでは一度も配線されてなかった(esp_hidd.c/nimble_hidd.c双方の既存ギャップ、このforkが元々持ってた問題ではない)ので、`nimble_hidd_dev_disconnect()`を追加して配線。公開ラッパー`kvm_ble_hidd_dev_disconnect()`も追加。
 - `main/mruby_filter.c`: `ble_pair_switch`/`ble_pair_new`/`ble_pair_slot`/`ble_pair_slot_bonded?`のDSL登録
 
+## 追記: `ble_toggle true`直後の`ble_pair_new`が失敗する(実機ログで発見)
+
+実機で`ble_toggle true`の直後(同じスクリプトのtick内、5ms差)に`ble_pair_new(1)`を呼んだところ失敗:
+
+```
+E (77958) NimBLE: ble_hs_hci_cmd_send_buf rc=22
+E (77959) NimBLE: error setting advertisement data; rc=22
+W (77961) MRBFILT: ble_pair_new(1) failed: ERROR
+I (77987) BLE_HID: started   ← ble_pair_newの呼び出しより30ms *後*に来てる
+```
+
+**原因**: `ble_hid_device_start()`は`s_started = true`を設定してすぐ返るが、これはNimBLEホストがコントローラとの同期ハンドシェイクを終える**前**("BLE_HID: started"ログ = `ESP_HIDD_START_EVENT`、実際の同期完了)。同期前に広告開始のHCIコマンドを送るとエラーになる。`ble_pair_switch`/`ble_pair_new`は`ble_hid_device_started()`(スタックが存在するか)だけをチェックしてたので、この競合を素通りしてしまってた。
+
+**対処**: `s_host_synced`フラグを追加(`ESP_HIDD_START_EVENT`で true、start()の頭とstop()でfalse)。`ble_hid_device_ready()`(`s_started && s_host_synced`)を新設。`switch_or_new()`は`ble_hid_device_ready()`が false ならエラーにせず、`s_pending_slot`/`s_pending_pairing_mode`にキューして`ESP_OK`を返す。`ble_pair_slots_resume_on_start()`(`ESP_HIDD_START_EVENT`から呼ばれる、同期完了後)がこのpendingを最優先でチェックするようにした(NVSに永続化された「最後にアクティブだったスロット」より優先)。
+
+「接続中に別スロットへ切り替え」用に既にあった`s_pending_slot`の仕組みをそのまま再利用しただけで、新しい状態変数は増やしていない。
+
+ビルド・フラッシュ済み。この特定の競合(`ble_toggle true`直後の`ble_pair_new`)が直ったかは実機再検証が必要。
+
 ## 未検証
 
 - 実機でのダイレクト広告の動作確認(意図した相手だけ繋がるか)は未確認。
