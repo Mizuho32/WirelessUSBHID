@@ -65,6 +65,20 @@
 - 実機で試したところ`esp-tls: Failed to create socket (family 2 socktype 1 protocol 0)`で失敗。TLS以前、素の`socket()`(TCP)自体が失敗していた - **HTTPSが無理という話ではなく、ソケット枯渇**だった。原因: `CONFIG_LWIP_MAX_SOCKETS`のデフォルト10のうち、`mruby_webui.c`のhttpdサーバーが`HTTPD_DEFAULT_CONFIG()`の`max_open_sockets=7`で7個も予約(うち3個はhttpd自身の内部処理用固定コストで、実際のクライアント接続に使えるのは実質4個)。残り3個をhid_forwarder.cのUDPソケット・debug_stream.cの別httpdインスタンス・DNS/NTP解決等で奪い合っており、そこに新規のHTTPS接続を足そうとして空きが無かった。
   - 対処: `CONFIG_LWIP_MAX_SOCKETS`を10→16に引き上げ(sdkconfig.defaults)。WebUI側の予約数を削る方向も検討したが、それだとWebUI自体が複数タブ/debug streamの常時接続と衝突して不安定になるリスクがあったため、上限を上げる方を選んだ(1ソケットあたり数百バイト程度の固定コストで、起動時に一度確保されるだけ - 今回ずっと追ってた類の"漏れ"とは性質が違う)。
 
+## 追記6: `crash_notify_test`が本当にクラッシュした(スタックオーバーフロー) - 安全網自体は正しく動いた
+
+実機で`crash_notify_test`を叩いたら、皮肉にも本当にクラッシュした:
+
+```
+***ERROR*** A stack overflow in task crash_notify_te has been detected.
+...
+esp_core_dump_flash: Core dump has been saved to flash.
+```
+
+原因は単純: `notify_task`(実際の通知POSTを行うタスク)のスタックを4096バイトにしてたが、`esp_http_client`+TLSハンドシェイク(mbedtlsの暗号/x509処理はそこそこスタックを食う)には不足していた。ESP-IDF公式の`https_request`サンプルが同じ`esp_http_client`+TLSの組み合わせに8192バイト割り当ててるのに合わせ、`NOTIFY_TASK_STACK_SIZE`を8192に引き上げ。
+
+**ただし収穫もあった**: ログの通り、`esp_core_dump_flash: Core dump has been saved to flash.`と、この安全網が実際のクラッシュを正しく捕捉・保存できることを実機で証明できた形になった。次の起動で`crash_report_init()`がこれを本物のクラッシュとして拾い、`crash_notify_url`を設定していれば(テスト通知ではなく)本物の通知が飛んだはず - 一連の仕組みが実際に機能する、良い実地検証になった。
+
 ## 参考
 
 - [[ble_idle_crash]] - この保険を作るきっかけになった調査
