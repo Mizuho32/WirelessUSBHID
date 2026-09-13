@@ -59,6 +59,12 @@
 
 ついでに、HTTPステータスコードのチェックも追加(以前は`esp_http_client_perform()`の戻り値=トランスポート層の成功/失敗しか見ておらず、トークン間違い等で401/403が返ってきても「成功」扱いのまま気づけなかった)。2xx以外なら`ESP_LOGW`で警告を出すようにした。
 
+## 追記5: `crash_notify_test` DSL + ソケット枯渇の修正
+
+- **`crash_notify_test`** - `simulate_crash`(再起動を挟む)を使わずに、`crash_notify_url`のURL/トークンが合ってるかその場で確認できるDSL。今すぐntfy.shへテストPOSTを1本飛ばす。`crash_notify_url`未設定なら`ESP_ERR_INVALID_STATE`で例外を上げる。
+- 実機で試したところ`esp-tls: Failed to create socket (family 2 socktype 1 protocol 0)`で失敗。TLS以前、素の`socket()`(TCP)自体が失敗していた - **HTTPSが無理という話ではなく、ソケット枯渇**だった。原因: `CONFIG_LWIP_MAX_SOCKETS`のデフォルト10のうち、`mruby_webui.c`のhttpdサーバーが`HTTPD_DEFAULT_CONFIG()`の`max_open_sockets=7`で7個も予約(うち3個はhttpd自身の内部処理用固定コストで、実際のクライアント接続に使えるのは実質4個)。残り3個をhid_forwarder.cのUDPソケット・debug_stream.cの別httpdインスタンス・DNS/NTP解決等で奪い合っており、そこに新規のHTTPS接続を足そうとして空きが無かった。
+  - 対処: `CONFIG_LWIP_MAX_SOCKETS`を10→16に引き上げ(sdkconfig.defaults)。WebUI側の予約数を削る方向も検討したが、それだとWebUI自体が複数タブ/debug streamの常時接続と衝突して不安定になるリスクがあったため、上限を上げる方を選んだ(1ソケットあたり数百バイト程度の固定コストで、起動時に一度確保されるだけ - 今回ずっと追ってた類の"漏れ"とは性質が違う)。
+
 ## 参考
 
 - [[ble_idle_crash]] - この保険を作るきっかけになった調査
