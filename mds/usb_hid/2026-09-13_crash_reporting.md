@@ -50,6 +50,15 @@
 - **「coredump消さなくて良くない?」** → その通りだった。ESP-IDFの`CONFIG_ESP_COREDUMP_FLASH_NO_OVERWRITE`(このプロジェクトでは未設定=デフォルトの`n`)により、**次のクラッシュで既存のcoredumpは自動的に上書きされる** - 手動で消す必要は元々無かった。`esp_core_dump_image_erase()`の呼び出しを削除。むしろ消さないほうが良い: 生のELFダンプ(レジスタ・フルバックトレース・全タスクスタック)が残るので、NVSの短い要約だけでは足りない時に`idf.py coredump-info`等でシリアル経由の深掘りができる。128Kの固定パーティションなので保持し続けても容量的なデメリットも無い。
 - **「同じバグでもクラッシュなら通知していい」** → 元々の設計意図を誤解していた。「うざい」の実体は**通常再起動(OTA更新やスクリプトの`restart`等)で誤って通知が飛ぶこと**への懸念で、それは元から`is_crash_like()`(reset reasonのチェック)で完全に防がれている - `crash_notify_url`はクラッシュ相当のreset reasonでしか発火しない。「同じバグの再発を通知しない」抑制ロジックは不要だったので削除し、**クラッシュなら毎回必ず通知する**ように変更。ただし「何回目の再発か」の情報自体は有用なので、`recurred Nx since last cleared`のカウント表示はそのまま残した(通知の可否には影響しない、WebUI表示のみ) - 「Clear last crash」ボタンはこのカウンタを1にリセットするだけの、純粋に表示上の意味になった。
 
+## 追記4: ntfyのトークン(認証)対応
+
+指摘の通り、当初`crash_notify_url`はURLだけでトークンを考慮してなかった。ntfy公式の`curl -H "Authorization: Bearer tk_..." -d "body" url`と同じ形に対応:
+
+- `crash_notify_url "https://ntfy.sh/my-topic"` - 従来通り(公開/無認証トピック向け、Authorizationヘッダ自体を送らない)
+- `crash_notify_url "https://ntfy.sh/my-topic", "tk_xxxxxxxx"` - 第2引数(省略可)がトークン。セルフホストのアクセス制御付きサーバーや、ntfy.shの*reserved*トピック向け。内部で`Authorization: Bearer <token>`ヘッダとして送信。
+
+ついでに、HTTPステータスコードのチェックも追加(以前は`esp_http_client_perform()`の戻り値=トランスポート層の成功/失敗しか見ておらず、トークン間違い等で401/403が返ってきても「成功」扱いのまま気づけなかった)。2xx以外なら`ESP_LOGW`で警告を出すようにした。
+
 ## 参考
 
 - [[ble_idle_crash]] - この保険を作るきっかけになった調査
