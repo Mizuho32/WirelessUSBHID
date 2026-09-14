@@ -94,6 +94,29 @@ pipeline(:uart_log) { from :dbg; to :log_pc }
 mrubyをビルド時に無効化した場合かスクリプトの読み込みに失敗した場合の非常用fallbackに
 過ぎない。通常の編集対象ではない。
 
+## USB Hostバックエンドの切り替え
+
+`:usb_host`sourceが実際にどの回路で物理キーボード/マウスを読むかは、このプロジェクトの
+ポイントの1つ - 3系統から**スクリプト側で**選べる:
+
+- **`:rp2040_bridge`** - RP2040経由のUARTブリッジ(`rp2040_host_bridge/`のファームウェアを
+  書き込んだ別チップ経由)。存在確認(プローブ)して見つかった場合のみ採用
+- **`:max3421`** - MAX3421E(SPI外付けUSB Hostチップ)。同じくプローブして見つかった場合のみ
+  採用。ネイティブOTGが一部ワイヤレスドングルの報告を3バイトに切り詰めるバグの回避策
+- **`:native_otg`** - ESP32-S3自身のネイティブUSB OTGポートをHost入力として使う。プローブ無し、
+  リストに到達したら無条件で採用。ただしこのポートは基板に1つしかないので、`:typec`sink
+  (直結Target PCへのUSB HIDエミュレート出力)とは同時に使えない
+
+```ruby
+usb_host_backends :rp2040_bridge, :max3421, :native_otg   # 優先順で列挙
+```
+
+先頭から順に「存在すれば採用」で試す(`:native_otg`だけは無条件採用なので事実上の最終fallback)。
+スクリプトが呼ばなければデフォルトは`rp2040_bridge → max3421 → native_otg`の順(ただし`:udp`
+sourceを宣言している場合は`native_otg`を外し、ネイティブポートを`:typec`出力用に空けておく)。
+どれも見つからず`:native_otg`もリストに無ければ、ローカルUSB Host入力は無し
+(`:udp`source経由のネットワーク入力専用構成)として、ネイティブポートは`:typec`出力用に空く。
+
 ## DSLリファレンス
 
 ### 配線の核 - source / sink / pipeline
