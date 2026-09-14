@@ -105,10 +105,42 @@ I (33901597) MRBFILT: script: "up before long press"  <- toggle on -> クラッ�
 
 深追いのコストに対して収穫逓減と判断し、ここで一旦区切りとした。
 
+### 追記4: 別物の実クラッシュを`crash_report.c`のcoredumpで捕捉 - InterruptWDTTimeoutCPU0、ヒープとは無関係
+
+追記3の後、実際にもう一度クラッシュが発生 - 今度は[[crash_reporting]]で作ったcoredump-to-flashが実機で本番デビューし、フルのELF coredumpを`data/2026-09-14_ble_idle_crash.core`として回収できた(`idf.py -B build.host -D KVM_ROLE=HOST -p /dev/ttyACM0 coredump-info -s ...`)。
+
+**解析結果 - 元のENOMEMクラッシュとは全くの別物と判明**:
+
+```
+Crashed task handle: 0x3fcf0530, name: 'btController'
+exccause  0x45 (InterruptWDTTimoutCPU0)
+```
+
+`btController`タスクのバックトレース:
+```
+r_lld_core_init -> r_lld_init -> r_rwble_init -> r_rwip_reset
+  -> btdm_controller_on_reset -> btdm_controller_task
+```
+(クローズドソースのBTコントローラバイナリ内部。`esp_bt_controller_enable()`が`btController`タスクに投げた無線リセット/再初期化処理そのもの。)
+
+同時刻の`usb_host_rp2040`タスク(dispatch_task)側は`ruby_ble_toggle`→`ble_hid_device_start()`→`esp_bt_controller_enable()`の中で`btController`の完了をセマフォ待ちしていた - つまり「無操作放置後、キー入力で`ble_toggle true`を実行 → BTコントローラの再有効化が走る」という、これまでと同じトリガ条件。
+
+さらに決定的だったのが`wifi`タスクの同時刻バックトレース: `pm_on_coex_start()`(WiFi/BT共存の開始通知)の中から`ESP_LOGI`で"Coexist!!! Wi-Fi station would only keep waked when available"を出力中に、ブロッキングなUART書き込み(`vfprintf`→`uart_write`)の真っ最中だった。BT再有効化のたびにWiFi側の共存アービタが呼ばれ、そのINFOログ出力がブロッキングI/Oで時間を食う - これがCPU0側で`r_lld_core_init`の完了を(デフォルト300msの)割り込みウォッチドッグ内に収まらせられなかった一因と考えられる。
+
+**結論**: 追記3までの調査は「ヒープリーク」という前提で行っていたが、少なくとも今回捕まえた実クラッシュはヒープと無関係 - CPU0が300ms以上ブロックされたことによる素の割り込みウォッチドッグ発火だった。これで「9時間放置→BLE ON でクラッシュ」という同じ現象の裏に、実は複数の異なる不具合(ENOMEM由来のものと、このWDT由来のもの)が混在していた可能性が高いと分かった。
+
+**対処(実装・ビルド・flash済み)**:
+1. `wifi_manager.c`: `esp_log_level_set("wifi", ESP_LOG_WARN)` を追加 - コアダンプで実際にブロッキング中だったと確認できた"Coexist!!!"のINFOログを黙らせ、共存イベント開始時の余計な遅延要因を1つ除去(`esp_hid_gap.c`の`"NimBLE"`タグに対する既存の対処と同じ理屈)。
+2. `sdkconfig.defaults`: `CONFIG_ESP_INT_WDT_TIMEOUT_MS` を300→800に緩和 - クローズドソースのBTコントローラ自体の遅さは直接直しようがないため、実際にハングしているわけではない遅いケースに猶予を与える防御的対策。タスクWDT(5秒、別設定)は変更なしでそのまま生きているので、本当にハングした場合の検知は失われない。
+
+再現待ちだが、少なくとも今回捕まえたコードパスの既知の遅延要因は塞いだ状態。次に同じ条件でクラッシュが起きた場合、`crash_report.c`のWebUI/ntfy通知とcoredumpで即座に検知・解析できる。
+
 ## 参考
 
 - [[ble_dynamic_enable]] - `ble_dynamic true`/`ble_toggle`の設計
 - [[ble_multi_pair]], [[ble_multi_pair_own_address]] - このセッションの直前に解決したマルチペア関連の別issue群
+- [[crash_reporting]] - coredump-to-flash + WebUI/ntfy通知の安全網(追記4のクラッシュ捕捉に使用)
 - `esp32-kvm-ip/main/esp_hid_gap.c`の`esp_hid_ble_gap_adv_init()`/`deinit_low_level()`
 - `esp32-kvm-ip/main/ble_hid_device.c`の`ble_hid_device_start()`/`ble_hid_device_stop()`
-- `data/2026-09-13_ble_idle_crash.log` - 実機ログ全体
+- `data/2026-09-13_ble_idle_crash.log` - 実機ログ全体(追記3までのヒープ推移)
+- `data/2026-09-14_ble_idle_crash.core` - 追記4のELF coredump本体
